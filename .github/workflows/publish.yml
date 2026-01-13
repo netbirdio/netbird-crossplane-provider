@@ -13,7 +13,7 @@ env:
   DOCKER_BUILDX_VERSION: 'v0.9.1'
 
   # Registry/Org names
-  CROSSPLANE_REGORG: 'ghcr.io/infitx-org'
+  CROSSPLANE_REGORG: 'ghcr.io/netbirdio'
 
 jobs:
   publish-provider:
