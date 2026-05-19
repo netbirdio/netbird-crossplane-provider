@@ -239,6 +239,45 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	}, nil
 }
 
+// resolveGroupIDs translates the user-supplied group references on the
+// NbNetworkResource spec into the API-side group ids the netbird mgmt
+// API expects.
+//
+// Each spec entry can identify a group by Id (preferred — stable, set
+// directly by the user or by another Crossplane MR) or by Name (a
+// human-readable fallback resolved against the account's current group
+// list). Either pointer may be nil.
+//
+// Previously this loop unconditionally deref'd `*provgroup.Name`, which
+// panicked whenever the spec omitted Name (a common case — Id is the
+// canonical reference and Name is optional in the schema).
+func resolveGroupIDs(provgroups []v1alpha1.GroupMinimum, apigroups []nbapi.Group) ([]string, error) {
+	out := make([]string, 0, len(provgroups))
+	for _, provgroup := range provgroups {
+		// Prefer the explicit Id if supplied — no API lookup needed.
+		if provgroup.Id != nil && *provgroup.Id != "" {
+			out = append(out, *provgroup.Id)
+			continue
+		}
+		// Fall back to name lookup.
+		if provgroup.Name == nil || *provgroup.Name == "" {
+			return nil, errors.New("group reference missing both id and name")
+		}
+		var matched bool
+		for _, apigroup := range apigroups {
+			if apigroup.Name == *provgroup.Name {
+				out = append(out, apigroup.Id)
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return nil, errors.Errorf("group not found by name: %q", *provgroup.Name)
+		}
+	}
+	return out, nil
+}
+
 func convertGroups(groupMinimums []nbapi.GroupMinimum) *[]v1alpha1.GroupMinimum {
 	groups := make([]v1alpha1.GroupMinimum, len(groupMinimums))
 	for i, g := range groupMinimums {
@@ -280,14 +319,9 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 	if err != nil {
 		return managed.ExternalCreation{}, err
 	}
-	groupids := make([]string, len(*cr.Spec.ForProvider.Groups))
-	for j, provgroup := range *cr.Spec.ForProvider.Groups {
-		for _, apigroup := range groups {
-			if apigroup.Name == *provgroup.Name {
-				groupids[j] = apigroup.Id
-				break
-			}
-		}
+	groupids, err := resolveGroupIDs(*cr.Spec.ForProvider.Groups, groups)
+	if err != nil {
+		return managed.ExternalCreation{}, err
 	}
 	networkresource, err := client.Networks.Resources(apinetwork.Id).Create(ctx, nbapi.NetworkResourceRequest{
 		Enabled:     cr.Spec.ForProvider.Enabled,
@@ -340,14 +374,9 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 	if err != nil {
 		return managed.ExternalUpdate{}, err
 	}
-	groupids := make([]string, len(*cr.Spec.ForProvider.Groups))
-	for j, provgroup := range *cr.Spec.ForProvider.Groups {
-		for _, apigroup := range groups {
-			if apigroup.Name == *provgroup.Name {
-				groupids[j] = apigroup.Id
-				break
-			}
-		}
+	groupids, err := resolveGroupIDs(*cr.Spec.ForProvider.Groups, groups)
+	if err != nil {
+		return managed.ExternalUpdate{}, err
 	}
 
 	_, err2 := client.Networks.Resources(apinetwork.Id).Update(ctx, networkResourceId, nbapi.PutApiNetworksNetworkIdResourcesResourceIdJSONRequestBody{
