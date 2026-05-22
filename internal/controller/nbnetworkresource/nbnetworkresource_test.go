@@ -48,11 +48,15 @@ type fakeAuthClient struct {
 	client *netbird.Client
 }
 
+// GetClient returns the stubbed netbird REST client.
 func (f *fakeAuthClient) GetClient(_ context.Context) (*netbird.Client, error) {
 	return f.client, nil
 }
+
+// ForceRefresh is a no-op in the fake.
 func (f *fakeAuthClient) ForceRefresh(_ context.Context) error { return nil }
 
+// newFakeAuth returns a fakeAuthClient backed by an httptest server.
 func newFakeAuth(t *testing.T, h http.HandlerFunc) (*fakeAuthClient, *httptest.Server) {
 	t.Helper()
 	srv := httptest.NewServer(h)
@@ -63,6 +67,7 @@ func newFakeAuth(t *testing.T, h http.HandlerFunc) (*fakeAuthClient, *httptest.S
 	return &fakeAuthClient{client: c}, srv
 }
 
+// TestResolveNetworkResourceLookupID exercises the lookup-ID resolver helper.
 func TestResolveNetworkResourceLookupID(t *testing.T) {
 	cases := map[string]struct {
 		cr   *v1alpha1.NbNetworkResource
@@ -111,6 +116,7 @@ func TestResolveNetworkResourceLookupID(t *testing.T) {
 	}
 }
 
+// TestIsNetworkResourceNotFoundError exercises the not-found error matcher.
 func TestIsNetworkResourceNotFoundError(t *testing.T) {
 	cases := map[string]struct {
 		err  error
@@ -136,6 +142,7 @@ func TestIsNetworkResourceNotFoundError(t *testing.T) {
 	}
 }
 
+// TestObserve covers the Observe code paths in this controller.
 func TestObserve(t *testing.T) {
 	t.Run("EmptyExternalNameAndEmptyStatusReturnsResourceExistsFalse", func(t *testing.T) {
 		// Network listing returns one network so adoption can run, then resource
@@ -265,6 +272,7 @@ func TestObserve(t *testing.T) {
 	})
 }
 
+// TestResolveGroupIDs exercises the spec-to-API group ID resolver.
 func TestResolveGroupIDs(t *testing.T) {
 	strp := func(s string) *string { return &s }
 	api := []nbapi.Group{

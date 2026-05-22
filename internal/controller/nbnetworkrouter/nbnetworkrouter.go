@@ -125,11 +125,13 @@ type authClient interface {
 	ForceRefresh(ctx context.Context) error
 }
 
+// external implements managed.ExternalClient for the NbNetworkRouter managed resource.
 type external struct {
 	authManager authClient
 	log         logr.Logger
 }
 
+// Observe checks whether the NbNetworkRouter currently exists in netbird and updates status.
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
 	cr, ok := mg.(*v1alpha1.NbNetworkRouter)
 	if !ok {
@@ -340,6 +342,7 @@ func isNetworkRouterNotFoundError(err error) bool {
 	return strings.Contains(errStr, "router") && strings.Contains(errStr, "not found")
 }
 
+// Create provisions a new netbird network router for the managed resource.
 func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
 	cr, ok := mg.(*v1alpha1.NbNetworkRouter)
 	if !ok {
@@ -395,6 +398,7 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 	return managed.ExternalCreation{}, nil
 }
 
+// Update applies the desired spec to the existing netbird network router.
 func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.ExternalUpdate, error) {
 	cr, ok := mg.(*v1alpha1.NbNetworkRouter)
 	if !ok {
@@ -418,6 +422,7 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 	}, nil
 }
 
+// Delete removes the netbird network router associated with this managed resource.
 func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 	cr, ok := mg.(*v1alpha1.NbNetworkRouter)
 	if !ok {

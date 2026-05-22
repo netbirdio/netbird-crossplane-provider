@@ -86,6 +86,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 		Complete(ratelimiter.NewReconciler(name, r, o.GlobalRateLimiter))
 }
 
+// connector produces an ExternalClient for NbNetworkResource managed resources.
 type connector struct {
 	*auth.SharedConnector
 }
@@ -117,16 +118,19 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	}, nil
 }
 
+// authClient is the subset of the netbird auth manager used by this controller.
 type authClient interface {
 	GetClient(ctx context.Context) (*netbird.Client, error)
 	ForceRefresh(ctx context.Context) error
 }
 
+// external implements managed.ExternalClient for the NbNetworkResource managed resource.
 type external struct {
 	authManager authClient
 	log         logr.Logger
 }
 
+// Observe checks whether the NbNetworkResource currently exists in netbird and updates status.
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
 	cr, ok := mg.(*v1alpha1.NbNetworkResource)
 	if !ok {
@@ -328,6 +332,7 @@ func resolveGroupIDs(provgroups []v1alpha1.GroupMinimum, apigroups []nbapi.Group
 	return out, nil
 }
 
+// convertGroups maps netbird API group minimums into the local v1alpha1 representation.
 func convertGroups(groupMinimums []nbapi.GroupMinimum) *[]v1alpha1.GroupMinimum {
 	groups := make([]v1alpha1.GroupMinimum, len(groupMinimums))
 	for i, g := range groupMinimums {
@@ -342,6 +347,7 @@ func convertGroups(groupMinimums []nbapi.GroupMinimum) *[]v1alpha1.GroupMinimum 
 	return &groups
 }
 
+// Create provisions a new netbird network resource for the managed resource.
 func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
 	cr, ok := mg.(*v1alpha1.NbNetworkResource)
 	if !ok {
@@ -396,6 +402,7 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 // 	return groups
 // }
 
+// Update applies the desired spec to the existing netbird network resource.
 func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.ExternalUpdate, error) {
 	cr, ok := mg.(*v1alpha1.NbNetworkResource)
 	if !ok {
@@ -450,6 +457,7 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 	}, nil
 }
 
+// Delete removes the netbird network resource associated with this managed resource.
 func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 	cr, ok := mg.(*v1alpha1.NbNetworkResource)
 	if !ok {
