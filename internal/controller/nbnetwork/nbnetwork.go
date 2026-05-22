@@ -18,6 +18,7 @@ package nbnetwork
 
 import (
 	"context"
+	"strings"
 
 	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/pkg/connection"
@@ -34,6 +35,7 @@ import (
 	"github.com/crossplane/netbird-crossplane-provider/internal/features"
 	"github.com/go-logr/logr"
 	"github.com/google/go-cmp/cmp"
+	netbird "github.com/netbirdio/netbird/management/client/rest"
 	nbapi "github.com/netbirdio/netbird/management/server/http/api"
 	"github.com/pkg/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -66,6 +68,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 		managed.WithPollInterval(o.PollInterval),
 		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
 		managed.WithConnectionPublishers(cps...),
+		managed.WithInitializers(),
 	}
 	if o.Features.Enabled(feature.EnableBetaManagementPolicies) {
 		reconcilerOptions = append(reconcilerOptions, managed.WithManagementPolicies())
@@ -119,8 +122,13 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 
 // An ExternalClient observes, then either creates, updates, or deletes an
 // external resource to ensure it reflects the managed resource's desired state.
+type authClient interface {
+	GetClient(ctx context.Context) (*netbird.Client, error)
+	ForceRefresh(ctx context.Context) error
+}
+
 type external struct {
-	authManager *auth.AuthManager
+	authManager authClient
 	log         logr.Logger
 }
 
@@ -135,9 +143,13 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	}
 	c.log.Info("observing", "cr", cr)
 	externalName := meta.GetExternalName(cr)
+	lookupID := resolveNetworkLookupID(cr)
 
-	// Adoption pattern: if externalName is blank or matches resource name, try to find by Name
-	if externalName == "" || externalName == cr.Name {
+	// Adoption pattern: if we don't yet have a stable provider ID, try to find by Name.
+	// lookupID == "" covers a fresh resource with no external name and no status ID.
+	// lookupID == cr.Name covers older reconciles that defaulted external-name to the k8s
+	// object name without ever recording a real status ID.
+	if lookupID == "" || lookupID == cr.Name {
 		networks, err := client.Networks.List(ctx)
 		if err != nil {
 			if auth.IsTokenInvalidError(err) {
@@ -172,17 +184,26 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
 
-	// If we have an external name (and it's not just the resource name), fetch by ID
-	network, err := client.Networks.Get(ctx, externalName)
+	// If we have a resolved lookup ID, fetch by ID.
+	network, err := client.Networks.Get(ctx, lookupID)
 	if err != nil {
 		if auth.IsTokenInvalidError(err) {
 			c.authManager.ForceRefresh(ctx)
 			return managed.ExternalObservation{}, err
 		}
-		c.log.Info("failed to get network")
-		return managed.ExternalObservation{
-			ResourceExists: false,
-		}, nil //return nil so that observe can return without error so that it passes to create.
+		if isNetworkNotFoundError(err) {
+			c.log.Info("network not found", "lookup-id", lookupID)
+			return managed.ExternalObservation{
+				ResourceExists: false,
+			}, nil
+		}
+		// Don't swallow transient errors — Crossplane should requeue, not call Create.
+		return managed.ExternalObservation{}, errors.Wrapf(err, "failed to observe network %q", lookupID)
+	}
+
+	// Repair stale or missing external-name annotations after recovering via status ID.
+	if externalName != network.Id {
+		meta.SetExternalName(cr, network.Id)
 	}
 
 	cr.Status.AtProvider = v1alpha1.NbNetworkObservation{
@@ -201,6 +222,33 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		ResourceExists:   true,
 		ResourceUpToDate: isnetworkuptodate(network, cr.Spec.ForProvider),
 	}, nil
+}
+
+// resolveNetworkLookupID picks the best identifier to use when looking the network
+// up by ID, falling back to the recorded provider ID when the external-name
+// annotation is missing or was defaulted to the Kubernetes object name by an
+// older reconcile (before WithInitializers disabled the NameAsExternalName default).
+func resolveNetworkLookupID(cr *v1alpha1.NbNetwork) string {
+	externalName := meta.GetExternalName(cr)
+	switch {
+	case externalName == "":
+		return cr.Status.AtProvider.Id
+	case cr.Status.AtProvider.Id != "" && externalName == cr.GetName() && cr.Status.AtProvider.Id != externalName:
+		// Recover from older reconciles that defaulted the external name to the Kubernetes object name.
+		return cr.Status.AtProvider.Id
+	default:
+		return externalName
+	}
+}
+
+// isNetworkNotFoundError matches the "network: <id> not found" message
+// returned by the netbird REST API for a missing network.
+func isNetworkNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "network") && strings.Contains(errStr, "not found")
 }
 
 func isnetworkuptodate(network *nbapi.Network, nbNetworkParameters v1alpha1.NbNetworkParameters) bool {
@@ -248,7 +296,10 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 	if err != nil {
 		return managed.ExternalUpdate{}, errors.Wrap(err, "failed to get authenticated client")
 	}
-	networkid := meta.GetExternalName(cr)
+	networkid := resolveNetworkLookupID(cr)
+	if networkid == "" {
+		return managed.ExternalUpdate{}, errors.New("can't find network id")
+	}
 	c.log.Info("Updating", "cr", cr)
 	_, err = client.Networks.Update(ctx, networkid, nbapi.PutApiNetworksNetworkIdJSONRequestBody{
 		Name:        cr.Spec.ForProvider.Name,
@@ -275,6 +326,9 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 		return errors.Wrap(err, "failed to get authenticated client")
 	}
 	c.log.Info("Deleting", "cr", cr)
-	networkid := meta.GetExternalName(cr)
+	networkid := resolveNetworkLookupID(cr)
+	if networkid == "" {
+		return errors.New("can't find network id")
+	}
 	return client.Networks.Delete(ctx, networkid)
 }
