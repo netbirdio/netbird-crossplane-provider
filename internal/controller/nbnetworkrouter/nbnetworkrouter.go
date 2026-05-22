@@ -18,6 +18,7 @@ package nbnetworkrouter
 
 import (
 	"context"
+	"strings"
 
 	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/pkg/connection"
@@ -33,6 +34,7 @@ import (
 	auth "github.com/crossplane/netbird-crossplane-provider/internal/controller/nb"
 	"github.com/crossplane/netbird-crossplane-provider/internal/features"
 	"github.com/go-logr/logr"
+	netbird "github.com/netbirdio/netbird/management/client/rest"
 	nbapi "github.com/netbirdio/netbird/management/server/http/api"
 	"github.com/pkg/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -65,6 +67,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 		managed.WithPollInterval(o.PollInterval),
 		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
 		managed.WithConnectionPublishers(cps...),
+		managed.WithInitializers(),
 	}
 	if o.Features.Enabled(feature.EnableBetaManagementPolicies) {
 		reconcilerOptions = append(reconcilerOptions, managed.WithManagementPolicies())
@@ -117,11 +120,18 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 
 // An ExternalClient observes, then either creates, updates, or deletes an
 // external resource to ensure it reflects the managed resource's desired state.
+type authClient interface {
+	GetClient(ctx context.Context) (*netbird.Client, error)
+	ForceRefresh(ctx context.Context) error
+}
+
+// external implements managed.ExternalClient for the NbNetworkRouter managed resource.
 type external struct {
-	authManager *auth.AuthManager
+	authManager authClient
 	log         logr.Logger
 }
 
+// Observe checks whether the NbNetworkRouter currently exists in netbird and updates status.
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
 	cr, ok := mg.(*v1alpha1.NbNetworkRouter)
 	if !ok {
@@ -133,9 +143,13 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	}
 	c.log.Info("observing", "cr", cr)
 	externalName := meta.GetExternalName(cr)
+	lookupID := resolveNetworkRouterLookupID(cr)
 
-	// Adoption pattern: if externalName is blank or matches cr.Name, try to find by PeerGroupName or Peer
-	if externalName == "" || externalName == cr.Name {
+	// Adoption pattern: if we don't yet have a stable provider ID, try to find by PeerGroupName or Peer.
+	// lookupID == "" covers a fresh resource with no external name and no status ID.
+	// lookupID == cr.Name covers older reconciles that defaulted external-name to the k8s
+	// object name without ever recording a real status ID.
+	if lookupID == "" || lookupID == cr.Name {
 		c.log.Info("external name blank or matches resource name, attempting adoption by PeerGroupName or Peer")
 		networks, err := client.Networks.List(ctx)
 		if err != nil {
@@ -252,17 +266,27 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	if apinetwork == nil {
 		return managed.ExternalObservation{}, errors.New("network not found")
 	}
-	networkrouter, err := client.Networks.Routers(apinetwork.Id).Get(ctx, externalName)
+	networkrouter, err := client.Networks.Routers(apinetwork.Id).Get(ctx, lookupID)
 	if err != nil {
 		if auth.IsTokenInvalidError(err) {
 			c.authManager.ForceRefresh(ctx)
 			return managed.ExternalObservation{}, err
 		}
-		c.log.Info("failed to get network router")
-		return managed.ExternalObservation{
-			ResourceExists: false,
-		}, nil //return nil so that observe can return without error so that it passes to create.
+		if isNetworkRouterNotFoundError(err) {
+			c.log.Info("network router not found", "lookup-id", lookupID)
+			return managed.ExternalObservation{
+				ResourceExists: false,
+			}, nil
+		}
+		// Don't swallow transient errors — Crossplane should requeue, not call Create.
+		return managed.ExternalObservation{}, errors.Wrapf(err, "failed to observe network router %q", lookupID)
 	}
+
+	// Repair stale or missing external-name annotations after recovering via status ID.
+	if externalName != networkrouter.Id {
+		meta.SetExternalName(cr, networkrouter.Id)
+	}
+
 	if networkrouter.PeerGroups != nil && len(*networkrouter.PeerGroups) >= 1 {
 		cr.Status.AtProvider = v1alpha1.NbNetworkRouterObservation{
 			Id:         networkrouter.Id,
@@ -290,6 +314,35 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	}, nil
 }
 
+// resolveNetworkRouterLookupID picks the best identifier to use when looking the
+// network router up by ID, falling back to the recorded provider ID when the
+// external-name annotation is missing or was defaulted to the Kubernetes object
+// name by an older reconcile (before WithInitializers disabled the
+// NameAsExternalName default).
+func resolveNetworkRouterLookupID(cr *v1alpha1.NbNetworkRouter) string {
+	externalName := meta.GetExternalName(cr)
+	switch {
+	case externalName == "":
+		return cr.Status.AtProvider.Id
+	case cr.Status.AtProvider.Id != "" && externalName == cr.GetName() && cr.Status.AtProvider.Id != externalName:
+		// Recover from older reconciles that defaulted the external name to the Kubernetes object name.
+		return cr.Status.AtProvider.Id
+	default:
+		return externalName
+	}
+}
+
+// isNetworkRouterNotFoundError matches the "router: <id> not found" / "network router: <id> not found"
+// messages returned by the netbird REST API for a missing network router.
+func isNetworkRouterNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "router") && strings.Contains(errStr, "not found")
+}
+
+// Create provisions a new netbird network router for the managed resource.
 func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
 	cr, ok := mg.(*v1alpha1.NbNetworkRouter)
 	if !ok {
@@ -345,6 +398,7 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 	return managed.ExternalCreation{}, nil
 }
 
+// Update applies the desired spec to the existing netbird network router.
 func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.ExternalUpdate, error) {
 	cr, ok := mg.(*v1alpha1.NbNetworkRouter)
 	if !ok {
@@ -368,6 +422,7 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 	}, nil
 }
 
+// Delete removes the netbird network router associated with this managed resource.
 func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 	cr, ok := mg.(*v1alpha1.NbNetworkRouter)
 	if !ok {
@@ -391,6 +446,9 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 	if apinetwork == nil {
 		return errors.New("network not found")
 	}
-	networkrouterid := meta.GetExternalName(cr)
+	networkrouterid := resolveNetworkRouterLookupID(cr)
+	if networkrouterid == "" {
+		return errors.New("can't find network router id")
+	}
 	return client.Networks.Routers(apinetwork.Id).Delete(ctx, networkrouterid)
 }
