@@ -131,10 +131,11 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 			c.authManager.ForceRefresh(ctx)
 			return managed.ExternalObservation{}, err
 		}
-		c.log.Info("failed to get DNS settings")
-		return managed.ExternalObservation{
-			ResourceExists: false,
-		}, nil //return nil so that observe can return without error so that it passes to create.
+		// NbDnsSetting is a singleton and Create is a no-op, so swallowing here
+		// is harmless today — but returning a wrapped error keeps the pattern
+		// consistent with the rest of the controllers and prevents future
+		// regressions if Create ever does real work.
+		return managed.ExternalObservation{}, errors.Wrap(err, "failed to get DNS settings")
 	}
 
 	cr.Status.AtProvider = v1alpha1.NbDnsSettingObservation{

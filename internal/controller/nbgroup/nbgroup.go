@@ -18,6 +18,7 @@ package nbgroup
 
 import (
 	"context"
+	"strings"
 
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
@@ -37,6 +38,7 @@ import (
 	"github.com/crossplane/netbird-crossplane-provider/apis/vpn/v1alpha1"
 	auth "github.com/crossplane/netbird-crossplane-provider/internal/controller/nb"
 	"github.com/crossplane/netbird-crossplane-provider/internal/features"
+	netbird "github.com/netbirdio/netbird/management/client/rest"
 	nbapi "github.com/netbirdio/netbird/management/server/http/api"
 )
 
@@ -67,6 +69,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 		managed.WithPollInterval(o.PollInterval),
 		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
 		managed.WithConnectionPublishers(cps...),
+		managed.WithInitializers(),
 	}
 	if o.Features.Enabled(feature.EnableBetaManagementPolicies) {
 		reconcilerOptions = append(reconcilerOptions, managed.WithManagementPolicies())
@@ -118,13 +121,19 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	}, nil
 }
 
-// An ExternalClient observes, then either creates, updates, or deletes an
-// external resource to ensure it reflects the managed resource's desired state.
+// authClient is the subset of the netbird auth manager used by this controller.
+type authClient interface {
+	GetClient(ctx context.Context) (*netbird.Client, error)
+	ForceRefresh(ctx context.Context) error
+}
+
+// external implements managed.ExternalClient for the NbGroup managed resource.
 type external struct {
-	authManager *auth.AuthManager
+	authManager authClient
 	log         logr.Logger
 }
 
+// Observe checks whether the NbGroup currently exists in netbird and updates status.
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
 
 	cr, ok := mg.(*v1alpha1.NbGroup)
@@ -137,9 +146,10 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	}
 	c.log.Info("Observing", "cr", cr)
 	externalName := meta.GetExternalName(cr)
+	lookupID := resolveGroupLookupID(cr)
 
-	// Adoption pattern: handle each case separately
-	if externalName == "" || externalName == cr.Name {
+	// Adoption pattern: if we don't yet have a stable provider ID, try to find by Name.
+	if lookupID == "" || lookupID == cr.Name {
 		c.log.Info("external name blank or matches resource name, attempting adoption by Name", "name", cr.Spec.ForProvider.Name)
 		groups, err := client.Groups.List(ctx)
 		if err != nil {
@@ -147,10 +157,7 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 				c.authManager.ForceRefresh(ctx)
 				return managed.ExternalObservation{}, err
 			}
-			c.log.Info("failed to list groups")
-			return managed.ExternalObservation{
-				ResourceExists: false,
-			}, nil //return nil so that observe can return without error so that it passes to create.
+			return managed.ExternalObservation{}, errors.Wrap(err, "failed to list groups for adoption")
 		}
 		for _, apigroup := range groups {
 			if apigroup.Name == cr.Spec.ForProvider.Name {
@@ -176,7 +183,7 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
 
-	if externalName == cr.Spec.ForProvider.Name {
+	if lookupID == cr.Spec.ForProvider.Name {
 		// Only check for existence, do not set external name
 		c.log.Info("external name matches ForProvider.Name, checking existence only", "name", cr.Spec.ForProvider.Name)
 		groups, err := client.Groups.List(ctx)
@@ -185,13 +192,10 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 				c.authManager.ForceRefresh(ctx)
 				return managed.ExternalObservation{}, err
 			}
-			c.log.Info("failed to list groups")
-			return managed.ExternalObservation{
-				ResourceExists: false,
-			}, nil //return nil so that observe can return without error so that it passes to create.
+			return managed.ExternalObservation{}, errors.Wrap(err, "failed to list groups by ForProvider.Name")
 		}
 		for _, apigroup := range groups {
-			if apigroup.Name == externalName {
+			if apigroup.Name == lookupID {
 				c.log.Info("found existing group by ForProvider.Name", "groupid", apigroup.Id)
 				cr.Status.SetConditions(xpv1.Available())
 				cr.Status.AtProvider = v1alpha1.NbGroupObservation{
@@ -212,19 +216,28 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
 
-	c.log.Info("external name set, fetching by ID", "externalName", externalName)
-	apigroup, err := client.Groups.Get(ctx, externalName)
+	c.log.Info("external name set, fetching by ID", "lookupID", lookupID)
+	apigroup, err := client.Groups.Get(ctx, lookupID)
 	if err != nil {
 		if auth.IsTokenInvalidError(err) {
 			c.authManager.ForceRefresh(ctx)
 			return managed.ExternalObservation{}, err
 		}
-		c.log.Info("failed to get group")
-		return managed.ExternalObservation{
-			ResourceExists: false,
-		}, nil //return nil so that observe can return without error so that it passes to create.
+		if isGroupNotFoundError(err) {
+			c.log.Info("group not found", "lookup-id", lookupID)
+			return managed.ExternalObservation{
+				ResourceExists: false,
+			}, nil
+		}
+		// Don't swallow transient errors — Crossplane should requeue, not call Create.
+		return managed.ExternalObservation{}, errors.Wrapf(err, "failed to observe group %q", lookupID)
 	}
 	group := *apigroup
+
+	// Repair stale or missing external-name annotations after recovering via status ID.
+	if externalName != group.Id {
+		meta.SetExternalName(cr, group.Id)
+	}
 
 	cr.Status.SetConditions(xpv1.Available())
 	c.log.Info("setting atprovider")
@@ -241,6 +254,35 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		ResourceExists:   true,
 		ResourceUpToDate: true, //since we don't update groups
 	}, nil
+}
+
+// resolveGroupLookupID picks the best identifier to use when looking the group
+// up by ID, falling back to the recorded provider ID when the external-name
+// annotation is missing or was defaulted to the Kubernetes object name by an
+// older reconcile (before WithInitializers disabled the NameAsExternalName default).
+func resolveGroupLookupID(cr *v1alpha1.NbGroup) string {
+	externalName := meta.GetExternalName(cr)
+	switch {
+	case externalName == "":
+		return cr.Status.AtProvider.Id
+	case cr.Status.AtProvider.Id != "" && externalName == cr.GetName() && cr.Status.AtProvider.Id != externalName:
+		// Recover from older reconciles that defaulted the external name to the Kubernetes object name.
+		return cr.Status.AtProvider.Id
+	default:
+		return externalName
+	}
+}
+
+// isGroupNotFoundError matches the "group: <id> not found" message returned
+// by the netbird REST API for a missing group. Does not match the
+// "nameserver group: <id> not found" form because Groups.Get is a different
+// endpoint and never returns that string.
+func isGroupNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "group") && strings.Contains(errStr, "not found")
 }
 
 func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
@@ -293,5 +335,9 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 		return errors.Wrap(err, "failed to get authenticated client")
 	}
 	c.log.Info("Deleting", "cr", cr)
-	return client.Groups.Delete(ctx, meta.GetExternalName(cr))
+	groupid := resolveGroupLookupID(cr)
+	if groupid == "" {
+		return errors.New("can't find group id")
+	}
+	return client.Groups.Delete(ctx, groupid)
 }

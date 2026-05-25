@@ -18,6 +18,7 @@ package nbaccesstoken
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -66,6 +67,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 		managed.WithPollInterval(o.PollInterval),
 		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
 		managed.WithConnectionPublishers(cps...),
+		managed.WithInitializers(),
 	}
 	if o.Features.Enabled(feature.EnableBetaManagementPolicies) {
 		reconcilerOptions = append(reconcilerOptions, managed.WithManagementPolicies())
@@ -117,11 +119,19 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	}, nil
 }
 
+// authClient is the subset of the netbird auth manager used by this controller.
+type authClient interface {
+	GetClient(ctx context.Context) (*netbird.Client, error)
+	ForceRefresh(ctx context.Context) error
+}
+
+// external implements managed.ExternalClient for the NbAccessToken managed resource.
 type external struct {
-	authManager *auth.AuthManager
+	authManager authClient
 	log         logr.Logger
 }
 
+// Observe checks whether the NbAccessToken currently exists in netbird and updates status.
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
 	cr, ok := mg.(*v1alpha1.NbAccessToken)
 	if !ok {
@@ -134,11 +144,14 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	c.log.Info("Observing", "cr", cr)
 
 	externalName := meta.GetExternalName(cr)
-	if externalName == "" {
+	lookupID := resolveAccessTokenLookupID(cr)
+	if lookupID == "" {
+		// Update clears both external-name and status.AtProvider.Id when rotating an
+		// expired token; observing after that should drive Crossplane to call Create
+		// (which mints a new PAT) rather than fail.
 		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
 
-	// If externalName is set, fetch by ID as usual
 	var userid string
 	if cr.Spec.ForProvider.UserName != nil {
 		users, err := client.Users.List(ctx)
@@ -148,14 +161,11 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 				c.authManager.ForceRefresh(ctx)
 				return managed.ExternalObservation{}, err
 			}
-			c.log.Info("accesskey not found")
-			return managed.ExternalObservation{
-				ResourceExists: false,
-			}, nil //return nil so that observe can return without error so that it passes to create.
+			return managed.ExternalObservation{}, errors.Wrap(err, "failed to list users for access token lookup")
 		}
 		var apiuser *nbapi.User
 		for _, user := range users {
-			if *user.IsServiceUser && (user.Name == *cr.Spec.ForProvider.UserName) {
+			if user.IsServiceUser != nil && *user.IsServiceUser && (user.Name == *cr.Spec.ForProvider.UserName) {
 				apiuser = &user
 				break
 			}
@@ -170,18 +180,28 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
 
-	accesstoken, err := client.Tokens.Get(ctx, userid, externalName)
+	accesstoken, err := client.Tokens.Get(ctx, userid, lookupID)
 	if err != nil {
 		if auth.IsTokenInvalidError(err) {
 			c.log.Error(err, "Token invalid error detected during get, forcing token refresh")
 			c.authManager.ForceRefresh(ctx)
 			return managed.ExternalObservation{}, err
 		}
-		c.log.Info("accesskey not found")
-		return managed.ExternalObservation{
-			ResourceExists: false,
-		}, nil //return nil so that observe can return without error so that it passes to create.
+		if isAccessTokenNotFoundError(err) {
+			c.log.Info("access token not found", "lookup-id", lookupID)
+			return managed.ExternalObservation{
+				ResourceExists: false,
+			}, nil
+		}
+		// Don't swallow transient errors — Crossplane should requeue, not mint a duplicate PAT.
+		return managed.ExternalObservation{}, errors.Wrapf(err, "failed to observe access token %q", lookupID)
 	}
+
+	// Repair stale or missing external-name annotations after recovering via status ID.
+	if externalName != accesstoken.Id {
+		meta.SetExternalName(cr, accesstoken.Id)
+	}
+
 	var lastused *string
 	if accesstoken.LastUsed != nil {
 		lastusedstring := accesstoken.LastUsed.Local().String()
@@ -205,6 +225,38 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		ResourceExists:   true,
 		ResourceUpToDate: true, // update logic can be added if needed
 	}, nil
+}
+
+// resolveAccessTokenLookupID picks the best identifier to use when looking the access
+// token up by ID, falling back to the recorded provider ID when the external-name
+// annotation is missing or was defaulted to the Kubernetes object name by an
+// older reconcile (before WithInitializers disabled the NameAsExternalName default).
+func resolveAccessTokenLookupID(cr *v1alpha1.NbAccessToken) string {
+	externalName := meta.GetExternalName(cr)
+	switch {
+	case externalName == "":
+		return cr.Status.AtProvider.Id
+	case cr.Status.AtProvider.Id != "" && externalName == cr.GetName() && cr.Status.AtProvider.Id != externalName:
+		// Recover from older reconciles that defaulted the external name to the Kubernetes object name.
+		return cr.Status.AtProvider.Id
+	default:
+		return externalName
+	}
+}
+
+// isAccessTokenNotFoundError matches the netbird REST API's not-found messages
+// for personal access tokens — both the "token: <id> not found" form returned by
+// the SetupKeys layer and the "PAT: <id> not found" form returned by the token
+// store.
+func isAccessTokenNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	if !strings.Contains(errStr, "not found") {
+		return false
+	}
+	return strings.Contains(errStr, "token") || strings.Contains(errStr, "pat")
 }
 
 func (c *external) getUserID(ctx context.Context, cr *v1alpha1.NbAccessToken, client *netbird.Client) (string, error) {
@@ -281,19 +333,23 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 	}
 
 	c.log.Info("Updating", "cr", cr)
-	externalName := meta.GetExternalName(cr)
-	if externalName == "" {
-		return managed.ExternalUpdate{}, errors.New("no externalname found")
+	lookupID := resolveAccessTokenLookupID(cr)
+	if lookupID == "" {
+		return managed.ExternalUpdate{}, errors.New("can't find access token id")
 	}
 	userid, err := c.getUserID(ctx, cr, client)
 	if err != nil {
 		return managed.ExternalUpdate{}, err
 	}
 
-	if err := client.Tokens.Delete(ctx, userid, externalName); err != nil {
+	if err := client.Tokens.Delete(ctx, userid, lookupID); err != nil {
 		return managed.ExternalUpdate{}, errors.Wrap(err, "failed to delete expired token")
 	}
+	// Clear both external-name and the recorded provider ID so the next Observe
+	// resolves to "" and drives Create — without clearing status, the resolver
+	// would fall back to a now-deleted ID.
 	meta.SetExternalName(cr, "")
+	cr.Status.AtProvider.Id = ""
 	return managed.ExternalUpdate{
 		ConnectionDetails: managed.ConnectionDetails{},
 	}, nil
@@ -309,9 +365,9 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 		return errors.Wrap(err, "failed to get authenticated client")
 	}
 
-	externalName := meta.GetExternalName(cr)
-	if externalName == "" {
-		return errors.New("no externalname found")
+	lookupID := resolveAccessTokenLookupID(cr)
+	if lookupID == "" {
+		return errors.New("can't find access token id")
 	}
 	c.log.Info("Deleting", "cr", cr)
 	var userid string
@@ -330,5 +386,5 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 	} else {
 		userid = *cr.Spec.ForProvider.UserId
 	}
-	return client.Tokens.Delete(ctx, userid, externalName)
+	return client.Tokens.Delete(ctx, userid, lookupID)
 }
