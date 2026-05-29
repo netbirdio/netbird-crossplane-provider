@@ -29,7 +29,7 @@ import (
 
 	"github.com/crossplane/netbird-crossplane-provider/apis/vpn/v1alpha1"
 
-	netbird "github.com/netbirdio/netbird/management/client/rest"
+	netbird "github.com/netbirdio/netbird/shared/management/client/rest"
 )
 
 // Unlike many Kubernetes projects Crossplane does not use third party testing

@@ -36,8 +36,8 @@ import (
 	"github.com/crossplane/netbird-crossplane-provider/internal/features"
 	"github.com/go-logr/logr"
 	"github.com/google/go-cmp/cmp"
-	netbird "github.com/netbirdio/netbird/management/client/rest"
-	nbapi "github.com/netbirdio/netbird/management/server/http/api"
+	netbird "github.com/netbirdio/netbird/shared/management/client/rest"
+	nbapi "github.com/netbirdio/netbird/shared/management/http/api"
 	"github.com/pkg/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 )

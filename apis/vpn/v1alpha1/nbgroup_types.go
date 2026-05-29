@@ -23,7 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
-	netbirdapi "github.com/netbirdio/netbird/management/server/http/api"
+	netbirdapi "github.com/netbirdio/netbird/shared/management/http/api"
 )
 
 // NbGroupParameters are the configurable fields of a NbGroup.
