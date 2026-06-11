@@ -145,12 +145,6 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 	externalName := meta.GetExternalName(cr)
 	lookupID := resolveAccessTokenLookupID(cr)
-	if lookupID == "" {
-		// Update clears both external-name and status.AtProvider.Id when rotating an
-		// expired token; observing after that should drive Crossplane to call Create
-		// (which mints a new PAT) rather than fail.
-		return managed.ExternalObservation{ResourceExists: false}, nil
-	}
 
 	var userid string
 	if cr.Spec.ForProvider.UserName != nil {
@@ -180,21 +174,57 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
 
-	accesstoken, err := client.Tokens.Get(ctx, userid, lookupID)
-	if err != nil {
-		if auth.IsTokenInvalidError(err) {
-			c.log.Error(err, "Token invalid error detected during get, forcing token refresh")
-			c.authManager.ForceRefresh(ctx)
-			return managed.ExternalObservation{}, err
+	// The lookup ID may be empty (fresh MR, or Update cleared both external-name and
+	// status.AtProvider.Id when rotating an expired token) or hold a non-ID value
+	// (object name or composition-stamped display name). Try it as an ID first, and
+	// otherwise fall back to adoption by Name under the resolved user so a Create
+	// whose external-name persist failed doesn't mint a duplicate PAT.
+	var accesstoken *nbapi.PersonalAccessToken
+	if lookupID != "" && lookupID != cr.Name && lookupID != cr.Spec.ForProvider.Name {
+		var err error
+		accesstoken, err = client.Tokens.Get(ctx, userid, lookupID)
+		if err != nil {
+			if auth.IsTokenInvalidError(err) {
+				c.log.Error(err, "Token invalid error detected during get, forcing token refresh")
+				c.authManager.ForceRefresh(ctx)
+				return managed.ExternalObservation{}, err
+			}
+			if !isAccessTokenNotFoundError(err) {
+				// Don't swallow transient errors — Crossplane should requeue, not mint a duplicate PAT.
+				return managed.ExternalObservation{}, errors.Wrapf(err, "failed to observe access token %q", lookupID)
+			}
+			c.log.Info("access token not found by id, attempting adoption by name", "lookup-id", lookupID)
 		}
-		if isAccessTokenNotFoundError(err) {
-			c.log.Info("access token not found", "lookup-id", lookupID)
-			return managed.ExternalObservation{
-				ResourceExists: false,
-			}, nil
+	}
+	if accesstoken == nil {
+		tokens, err := client.Tokens.List(ctx, userid)
+		if err != nil {
+			if auth.IsTokenInvalidError(err) {
+				c.log.Error(err, "Token invalid error detected during list, forcing token refresh")
+				c.authManager.ForceRefresh(ctx)
+				return managed.ExternalObservation{}, err
+			}
+			// Don't swallow transient errors — a failed list must not look like "doesn't exist".
+			return managed.ExternalObservation{}, errors.Wrap(err, "failed to list access tokens for adoption")
 		}
-		// Don't swallow transient errors — Crossplane should requeue, not mint a duplicate PAT.
-		return managed.ExternalObservation{}, errors.Wrapf(err, "failed to observe access token %q", lookupID)
+		for _, token := range tokens {
+			if token.Name == cr.Spec.ForProvider.Name {
+				c.log.Info("adopting existing access token", "token-id", token.Id)
+				meta.SetExternalName(cr, token.Id)
+				// Identity is persisted via status.atProvider.id (external-name set
+				// during Observe is not persisted by the runtime), which the lookup
+				// resolver prefers. Report up-to-date: Update would rotate (delete)
+				// the token, which must stay reserved for the expired path — an
+				// adopted expired token is rotated on the next reconcile's ID lookup.
+				cr.Status.AtProvider.Id = token.Id
+				cr.Status.SetConditions(xpv1.Available())
+				return managed.ExternalObservation{
+					ResourceExists:   true,
+					ResourceUpToDate: true,
+				}, nil
+			}
+		}
+		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
 
 	// Repair stale or missing external-name annotations after recovering via status ID.
@@ -236,8 +266,10 @@ func resolveAccessTokenLookupID(cr *v1alpha1.NbAccessToken) string {
 	switch {
 	case externalName == "":
 		return cr.Status.AtProvider.Id
-	case cr.Status.AtProvider.Id != "" && externalName == cr.GetName() && cr.Status.AtProvider.Id != externalName:
-		// Recover from older reconciles that defaulted the external name to the Kubernetes object name.
+	case cr.Status.AtProvider.Id != "" && cr.Status.AtProvider.Id != externalName &&
+		(externalName == cr.GetName() || externalName == cr.Spec.ForProvider.Name):
+		// Recover when the external name holds the Kubernetes object name (older
+		// reconciles) or the netbird display name (composition adoption hint).
 		return cr.Status.AtProvider.Id
 	default:
 		return externalName

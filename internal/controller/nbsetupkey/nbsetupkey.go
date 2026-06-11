@@ -148,27 +148,57 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	externalName := meta.GetExternalName(cr)
 	lookupID := resolveSetupKeyLookupID(cr)
 
-	if lookupID == "" {
-		// Update clears both external-name and status.AtProvider.Id when rotating a
-		// revoked/expired setup key; observing after that should drive Crossplane
-		// to call Create (mint new key) rather than fail.
-		return managed.ExternalObservation{ResourceExists: false}, nil
+	// The lookup ID may be empty (fresh MR, or Update cleared both external-name and
+	// status.AtProvider.Id when rotating a revoked/expired key) or hold a non-ID
+	// value (object name or composition-stamped display name). Try it as an ID
+	// first, and otherwise fall back to adoption by Name so a Create whose
+	// external-name persist failed doesn't mint a duplicate key.
+	var setupkey *api.SetupKey
+	if lookupID != "" && lookupID != cr.Name && lookupID != cr.Spec.ForProvider.Name {
+		var err error
+		setupkey, err = client.SetupKeys.Get(ctx, lookupID)
+		if err != nil {
+			if auth.IsTokenInvalidError(err) {
+				c.authManager.ForceRefresh(ctx)
+				return managed.ExternalObservation{}, err
+			}
+			if !isSetupKeyNotFoundError(err) {
+				// Don't swallow transient errors — Crossplane should requeue, not mint a duplicate key.
+				return managed.ExternalObservation{}, errors.Wrapf(err, "failed to observe setup key %q", lookupID)
+			}
+			c.log.Info("setup key not found by id, attempting adoption by name", "lookup-id", lookupID)
+		}
 	}
-
-	setupkey, err := client.SetupKeys.Get(ctx, lookupID)
-	if err != nil {
-		if auth.IsTokenInvalidError(err) {
-			c.authManager.ForceRefresh(ctx)
-			return managed.ExternalObservation{}, err
+	if setupkey == nil {
+		// Adoption by Name. Only valid keys are adopted: a revoked or expired key
+		// with a matching name is rotation leftover, and a deleted-but-still-listed
+		// key must not be re-adopted or rotation would never converge on Create.
+		keys, err := client.SetupKeys.List(ctx)
+		if err != nil {
+			if auth.IsTokenInvalidError(err) {
+				c.authManager.ForceRefresh(ctx)
+				return managed.ExternalObservation{}, err
+			}
+			// Don't swallow transient errors — a failed list must not look like "doesn't exist".
+			return managed.ExternalObservation{}, errors.Wrap(err, "failed to list setup keys for adoption")
 		}
-		if isSetupKeyNotFoundError(err) {
-			c.log.Info("setup key not found", "lookup-id", lookupID)
-			return managed.ExternalObservation{
-				ResourceExists: false,
-			}, nil
+		for _, key := range keys {
+			if key.Name == cr.Spec.ForProvider.Name && !key.Revoked && key.Expires.After(time.Now()) {
+				c.log.Info("adopting existing setup key", "setup-key-id", key.Id)
+				meta.SetExternalName(cr, key.Id)
+				// Identity is persisted via status.atProvider.id (external-name set
+				// during Observe is not persisted by the runtime), which the lookup
+				// resolver prefers. Report up-to-date: Update would rotate (delete)
+				// the key, which must stay reserved for the expired/revoked path.
+				cr.Status.AtProvider.Id = key.Id
+				cr.Status.SetConditions(xpv1.Available())
+				return managed.ExternalObservation{
+					ResourceExists:   true,
+					ResourceUpToDate: true,
+				}, nil
+			}
 		}
-		// Don't swallow transient errors — Crossplane should requeue, not mint a duplicate key.
-		return managed.ExternalObservation{}, errors.Wrapf(err, "failed to observe setup key %q", lookupID)
+		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
 
 	// Repair stale or missing external-name annotations after recovering via status ID.
@@ -214,8 +244,10 @@ func resolveSetupKeyLookupID(cr *v1alpha1.NbSetupKey) string {
 	switch {
 	case externalName == "":
 		return cr.Status.AtProvider.Id
-	case cr.Status.AtProvider.Id != "" && externalName == cr.GetName() && cr.Status.AtProvider.Id != externalName:
-		// Recover from older reconciles that defaulted the external name to the Kubernetes object name.
+	case cr.Status.AtProvider.Id != "" && cr.Status.AtProvider.Id != externalName &&
+		(externalName == cr.GetName() || externalName == cr.Spec.ForProvider.Name):
+		// Recover when the external name holds the Kubernetes object name (older
+		// reconciles) or the netbird display name (composition adoption hint).
 		return cr.Status.AtProvider.Id
 	default:
 		return externalName

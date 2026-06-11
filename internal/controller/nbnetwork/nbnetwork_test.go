@@ -170,13 +170,19 @@ func TestObserve(t *testing.T) {
 	})
 
 	t.Run("ByIDNotFoundReturnsResourceExistsFalse", func(t *testing.T) {
+		// Not-found by ID now falls back to adoption by name; with no matching
+		// network in the list the result is still ResourceExists: false.
 		auth, srv := newFakeAuth(t, func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/api/networks/real-id" && r.Method == http.MethodGet {
+			switch {
+			case r.URL.Path == "/api/networks/real-id" && r.Method == http.MethodGet:
 				w.WriteHeader(http.StatusNotFound)
 				w.Write([]byte(`{"message":"network: real-id not found","code":404}`))
-				return
+			case r.URL.Path == "/api/networks" && r.Method == http.MethodGet:
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`[]`))
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 			}
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 		})
 		defer srv.Close()
 
@@ -190,6 +196,38 @@ func TestObserve(t *testing.T) {
 		}
 		if obs.ResourceExists {
 			t.Errorf("expected ResourceExists=false on not-found, got %+v", obs)
+		}
+	})
+
+	t.Run("StaleExternalNameIDFallsBackToAdoptionByName", func(t *testing.T) {
+		auth, srv := newFakeAuth(t, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/api/networks/stale-id" && r.Method == http.MethodGet:
+				w.WriteHeader(http.StatusNotFound)
+				w.Write([]byte(`{"message":"network: stale-id not found","code":404}`))
+			case r.URL.Path == "/api/networks" && r.Method == http.MethodGet:
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`[{"id":"new-id","name":"my-net","resources":[],"policies":[],"routers":[],"routing_peers_count":0,"description":""}]`))
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+			}
+		})
+		defer srv.Close()
+
+		e := external{authManager: auth}
+		cr := &v1alpha1.NbNetwork{ObjectMeta: metav1.ObjectMeta{Name: "k8s-name"}}
+		meta.SetExternalName(cr, "stale-id")
+		cr.Spec.ForProvider.Name = "my-net"
+
+		obs, err := e.Observe(context.Background(), cr)
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if !obs.ResourceExists {
+			t.Fatalf("expected adoption (ResourceExists=true), got %+v", obs)
+		}
+		if got := meta.GetExternalName(cr); got != "new-id" {
+			t.Errorf("expected external-name repaired to 'new-id', got %q", got)
 		}
 	})
 

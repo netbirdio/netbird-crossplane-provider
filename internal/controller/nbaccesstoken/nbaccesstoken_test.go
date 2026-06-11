@@ -18,6 +18,8 @@ package nbaccesstoken
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -26,6 +28,10 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
 	"github.com/crossplane/crossplane-runtime/pkg/test"
 	auth "github.com/crossplane/netbird-crossplane-provider/internal/controller/nb"
+	netbird "github.com/netbirdio/netbird/shared/management/client/rest"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/crossplane/netbird-crossplane-provider/apis/vpn/v1alpha1"
 )
 
 // Unlike many Kubernetes projects Crossplane does not use third party testing
@@ -72,4 +78,100 @@ func TestObserve(t *testing.T) {
 			}
 		})
 	}
+}
+
+// fakeAuthClient satisfies the authClient interface and returns a real netbird
+// client pointed at an httptest server.
+type fakeAuthClient struct {
+	client *netbird.Client
+}
+
+// GetClient returns the stubbed netbird REST client.
+func (f *fakeAuthClient) GetClient(_ context.Context) (*netbird.Client, error) {
+	return f.client, nil
+}
+
+// ForceRefresh is a no-op in the fake.
+func (f *fakeAuthClient) ForceRefresh(_ context.Context) error { return nil }
+
+// newFakeAuth returns a fakeAuthClient backed by an httptest server.
+func newFakeAuth(t *testing.T, h http.HandlerFunc) (*fakeAuthClient, *httptest.Server) {
+	t.Helper()
+	srv := httptest.NewServer(h)
+	c := netbird.NewWithOptions(
+		netbird.WithManagementURL(srv.URL),
+		netbird.WithPAT("test-token"),
+	)
+	return &fakeAuthClient{client: c}, srv
+}
+
+// TestObserveAdoption covers adoption by name under the resolved user, which
+// prevents a Create whose external-name persist failed from minting a
+// duplicate PAT.
+func TestObserveAdoption(t *testing.T) {
+	t.Run("EmptyLookupAdoptsTokenByNameUnderUser", func(t *testing.T) {
+		auth, srv := newFakeAuth(t, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/api/users" && r.Method == http.MethodGet:
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`[{"id":"u-1","name":"svc-user","is_service_user":true,"email":"","role":"admin","auto_groups":[],"is_blocked":false,"issued":"api","status":"active"}]`))
+			case r.URL.Path == "/api/users/u-1/tokens" && r.Method == http.MethodGet:
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`[{"id":"t-1","name":"bootstrap-pat","expiration_date":"2099-01-01T00:00:00Z","created_by":"u-1","created_at":"2026-01-01T00:00:00Z"}]`))
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+			}
+		})
+		defer srv.Close()
+
+		userName := "svc-user"
+		e := external{authManager: auth}
+		cr := &v1alpha1.NbAccessToken{ObjectMeta: metav1.ObjectMeta{Name: "tenant-bootstrap-pat"}}
+		cr.Spec.ForProvider.Name = "bootstrap-pat"
+		cr.Spec.ForProvider.UserName = &userName
+
+		obs, err := e.Observe(context.Background(), cr)
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if !obs.ResourceExists {
+			t.Fatalf("expected adoption (ResourceExists=true), got %+v", obs)
+		}
+		if !obs.ResourceUpToDate {
+			t.Errorf("expected up-to-date on adoption (Update would rotate the token), got %+v", obs)
+		}
+		if cr.Status.AtProvider.Id != "t-1" {
+			t.Errorf("expected status.atProvider.id 't-1', got %q", cr.Status.AtProvider.Id)
+		}
+	})
+
+	t.Run("NoMatchingTokenReturnsResourceExistsFalse", func(t *testing.T) {
+		auth, srv := newFakeAuth(t, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/api/users" && r.Method == http.MethodGet:
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`[{"id":"u-1","name":"svc-user","is_service_user":true,"email":"","role":"admin","auto_groups":[],"is_blocked":false,"issued":"api","status":"active"}]`))
+			case r.URL.Path == "/api/users/u-1/tokens" && r.Method == http.MethodGet:
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`[]`))
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+			}
+		})
+		defer srv.Close()
+
+		userName := "svc-user"
+		e := external{authManager: auth}
+		cr := &v1alpha1.NbAccessToken{ObjectMeta: metav1.ObjectMeta{Name: "tenant-bootstrap-pat"}}
+		cr.Spec.ForProvider.Name = "bootstrap-pat"
+		cr.Spec.ForProvider.UserName = &userName
+
+		obs, err := e.Observe(context.Background(), cr)
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if obs.ResourceExists {
+			t.Errorf("expected ResourceExists=false with no matching token, got %+v", obs)
+		}
+	})
 }

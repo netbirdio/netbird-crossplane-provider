@@ -141,8 +141,26 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	externalName := meta.GetExternalName(cr)
 	lookupID := resolveNameServerLookupID(cr)
 
-	// Adoption pattern: if we don't yet have a stable provider ID, try to find by Name.
-	if lookupID == "" || lookupID == cr.Name {
+	// The external-name annotation is not guaranteed to hold a provider ID:
+	// it may be empty (fresh MR), the object name (older reconciles), or the
+	// netbird display name (composition adoption hint). Try the lookup ID as an
+	// ID first, and on not-found fall back to adoption by Name.
+	var nameservergroup *nbapi.NameserverGroup
+	if lookupID != "" && lookupID != cr.Name && lookupID != cr.Spec.ForProvider.Name {
+		nameservergroup, err = client.DNS.GetNameserverGroup(ctx, lookupID)
+		if err != nil {
+			if auth.IsTokenInvalidError(err) {
+				c.authManager.ForceRefresh(ctx)
+				return managed.ExternalObservation{}, err
+			}
+			if !isNameServerNotFoundError(err) {
+				// Don't swallow transient errors — Crossplane should requeue, not call Create.
+				return managed.ExternalObservation{}, errors.Wrapf(err, "failed to observe nameserver group %q", lookupID)
+			}
+			c.log.Info("nameserver group not found by id, attempting adoption by name", "lookup-id", lookupID)
+		}
+	}
+	if nameservergroup == nil {
 		groups, err := client.DNS.ListNameserverGroups(ctx)
 		if err != nil {
 			if auth.IsTokenInvalidError(err) {
@@ -160,28 +178,16 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		}
 		if found != nil {
 			meta.SetExternalName(cr, found.Id)
+			// Identity is persisted via status.atProvider.id (external-name set
+			// during Observe is not persisted by the runtime), which the lookup
+			// resolver prefers on subsequent reconciles.
+			cr.Status.AtProvider.Id = found.Id
 			return managed.ExternalObservation{
 				ResourceExists:   true,
 				ResourceUpToDate: false, // force a requeue for a fresh Observe
 			}, nil
 		}
 		return managed.ExternalObservation{ResourceExists: false}, nil
-	}
-
-	nameservergroup, err := client.DNS.GetNameserverGroup(ctx, lookupID)
-	if err != nil {
-		if auth.IsTokenInvalidError(err) {
-			c.authManager.ForceRefresh(ctx)
-			return managed.ExternalObservation{}, err
-		}
-		if isNameServerNotFoundError(err) {
-			c.log.Info("nameserver group not found", "lookup-id", lookupID)
-			return managed.ExternalObservation{
-				ResourceExists: false,
-			}, nil
-		}
-		// Don't swallow transient errors — Crossplane should requeue, not call Create.
-		return managed.ExternalObservation{}, errors.Wrapf(err, "failed to observe nameserver group %q", lookupID)
 	}
 
 	// Repair stale or missing external-name annotations after recovering via status ID.
@@ -220,8 +226,10 @@ func resolveNameServerLookupID(cr *v1alpha1.NbNameServer) string {
 	switch {
 	case externalName == "":
 		return cr.Status.AtProvider.Id
-	case cr.Status.AtProvider.Id != "" && externalName == cr.GetName() && cr.Status.AtProvider.Id != externalName:
-		// Recover from older reconciles that defaulted the external name to the Kubernetes object name.
+	case cr.Status.AtProvider.Id != "" && cr.Status.AtProvider.Id != externalName &&
+		(externalName == cr.GetName() || externalName == cr.Spec.ForProvider.Name):
+		// Recover when the external name holds the Kubernetes object name (older
+		// reconciles) or the netbird display name (composition adoption hint).
 		return cr.Status.AtProvider.Id
 	default:
 		return externalName

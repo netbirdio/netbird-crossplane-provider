@@ -147,9 +147,30 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	externalName := meta.GetExternalName(cr)
 	lookupID := resolvePolicyLookupID(cr)
 
-	// Adoption pattern: if we don't yet have a stable provider ID, try to find by Name.
-	if lookupID == "" || lookupID == cr.Name {
-		c.log.Info("external name blank or matches resource name, attempting adoption by Name", "name", cr.Spec.ForProvider.Name)
+	// The external-name annotation is not guaranteed to hold a provider ID (older
+	// reconciles defaulted it to the object name, and compositions may stamp the
+	// netbird display name as an adoption hint). Try the lookup ID as an ID first,
+	// and on not-found fall back to adoption by Name.
+	var policy *nbapi.Policy
+	if lookupID != "" && lookupID != cr.Name && lookupID != cr.Spec.ForProvider.Name {
+		var err error
+		policy, err = client.Policies.Get(ctx, lookupID)
+		if err != nil {
+			if auth.IsTokenInvalidError(err) {
+				c.authManager.ForceRefresh(ctx)
+				return managed.ExternalObservation{}, err
+			}
+			if !isPolicyNotFoundError(err) {
+				// Don't swallow transient errors — Crossplane should requeue, not call Create.
+				return managed.ExternalObservation{}, errors.Wrapf(err, "failed to observe policy %q", lookupID)
+			}
+			c.log.Info("policy not found by id, attempting adoption by name", "lookup-id", lookupID)
+		}
+	}
+	if policy == nil {
+		// Adoption by Name: the netbird policy may exist even though we hold no
+		// usable ID (fresh MR, or a Create whose external-name persist failed).
+		c.log.Info("attempting adoption by Name", "name", cr.Spec.ForProvider.Name)
 		policies, err := client.Policies.List(ctx)
 		if err != nil {
 			if auth.IsTokenInvalidError(err) {
@@ -164,6 +185,10 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 				if apipolicy.Id != nil {
 					meta.SetExternalName(cr, *apipolicy.Id)
 				}
+				// Identity is persisted via status.atProvider.id (external-name set
+				// during Observe is not persisted by the runtime), which the lookup
+				// resolver prefers on subsequent reconciles.
+				cr.Status.AtProvider.Id = apipolicy.Id
 				return managed.ExternalObservation{
 					ResourceExists:   true,
 					ResourceUpToDate: false, // force a requeue for a fresh Observe
@@ -172,22 +197,6 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		}
 		// Not found, resource does not exist
 		return managed.ExternalObservation{ResourceExists: false}, nil
-	}
-
-	policy, err := client.Policies.Get(ctx, lookupID)
-	if err != nil {
-		if auth.IsTokenInvalidError(err) {
-			c.authManager.ForceRefresh(ctx)
-			return managed.ExternalObservation{}, err
-		}
-		if isPolicyNotFoundError(err) {
-			c.log.Info("policy not found", "lookup-id", lookupID)
-			return managed.ExternalObservation{
-				ResourceExists: false,
-			}, nil
-		}
-		// Don't swallow transient errors — Crossplane should requeue, not call Create.
-		return managed.ExternalObservation{}, errors.Wrapf(err, "failed to observe policy %q", lookupID)
 	}
 
 	// Repair stale or missing external-name annotations after recovering via status ID.
@@ -215,8 +224,9 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 // resolvePolicyLookupID picks the best identifier to use when looking the policy
 // up by ID, falling back to the recorded provider ID when the external-name
-// annotation is missing or was defaulted to the Kubernetes object name by an
-// older reconcile (before WithInitializers disabled the NameAsExternalName default).
+// annotation is missing, was defaulted to the Kubernetes object name by an older
+// reconcile (before WithInitializers disabled the NameAsExternalName default), or
+// holds the netbird display name stamped by a composition as an adoption hint.
 func resolvePolicyLookupID(cr *v1alpha1.NbPolicy) string {
 	externalName := meta.GetExternalName(cr)
 	statusID := ""
@@ -226,8 +236,8 @@ func resolvePolicyLookupID(cr *v1alpha1.NbPolicy) string {
 	switch {
 	case externalName == "":
 		return statusID
-	case statusID != "" && externalName == cr.GetName() && statusID != externalName:
-		// Recover from older reconciles that defaulted the external name to the Kubernetes object name.
+	case statusID != "" && statusID != externalName &&
+		(externalName == cr.GetName() || externalName == cr.Spec.ForProvider.Name):
 		return statusID
 	default:
 		return externalName
@@ -312,13 +322,16 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 			ConnectionDetails: managed.ConnectionDetails{},
 		}, err
 	}
-	client.Policies.Update(ctx, policyid, nbapi.PutApiPoliciesPolicyIdJSONRequestBody{
+	_, err = client.Policies.Update(ctx, policyid, nbapi.PutApiPoliciesPolicyIdJSONRequestBody{
 		Name:                cr.Spec.ForProvider.Name,
 		Description:         cr.Spec.ForProvider.Description,
 		Enabled:             cr.Spec.ForProvider.Enabled,
 		SourcePostureChecks: cr.Spec.ForProvider.SourcePostureChecks,
 		Rules:               rules,
 	})
+	if err != nil {
+		return managed.ExternalUpdate{}, errors.Wrapf(err, "failed to update policy %q", policyid)
+	}
 	return managed.ExternalUpdate{
 		// Optionally return any details that may be required to connect to the
 		// external resource. These will be stored as the connection secret.
