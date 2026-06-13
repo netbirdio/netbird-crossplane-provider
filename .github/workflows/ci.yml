@@ -10,7 +10,11 @@ on:
 
 env:
   # Common versions
-  GO_VERSION: '1.21'
+  # Must match the `go` directive in go.mod (bumped to 1.25.5 with the netbird
+  # SDK v0.71.4 upgrade). If this is lower, setup-go installs the older Go and
+  # the go.mod directive triggers a toolchain auto-download whose `covdata`
+  # tool is absent, failing the coverage step in `make test`.
+  GO_VERSION: '1.25.5'
   GOLANGCI_VERSION: 'v1.54.0'
   DOCKER_BUILDX_VERSION: 'v0.9.1'
 
