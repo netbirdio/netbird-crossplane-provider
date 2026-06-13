@@ -166,9 +166,9 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	}
 
 	// The external-name annotation is not guaranteed to hold a provider ID (older
-	// reconciles defaulted it to the object name, and compositions may stamp their
-	// own value). Try the lookup ID as an ID first, and on not-found fall back to
-	// adoption by PeerGroupName or Peer within the parent network.
+	// reconciles defaulted it to the object name, or it may hold a display name set
+	// as an adoption hint). Try the lookup ID as an ID first, and on not-found fall
+	// back to adoption by PeerGroupName or Peer within the parent network.
 	if lookupID != "" && lookupID != cr.Name {
 		networkrouter, err := client.Networks.Routers(apinetwork.Id).Get(ctx, lookupID)
 		switch {

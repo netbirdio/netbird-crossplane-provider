@@ -150,7 +150,7 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 	// The lookup ID may be empty (fresh MR, or Update cleared both external-name and
 	// status.AtProvider.Id when rotating a revoked/expired key) or hold a non-ID
-	// value (object name or composition-stamped display name). Try it as an ID
+	// value (object name or display-name adoption hint). Try it as an ID
 	// first, and otherwise fall back to adoption by Name so a Create whose
 	// external-name persist failed doesn't mint a duplicate key.
 	var setupkey *api.SetupKey
@@ -247,7 +247,7 @@ func resolveSetupKeyLookupID(cr *v1alpha1.NbSetupKey) string {
 	case cr.Status.AtProvider.Id != "" && cr.Status.AtProvider.Id != externalName &&
 		(externalName == cr.GetName() || externalName == cr.Spec.ForProvider.Name):
 		// Recover when the external name holds the Kubernetes object name (older
-		// reconciles) or the netbird display name (composition adoption hint).
+		// reconciles) or the netbird display name (used as an adoption hint).
 		return cr.Status.AtProvider.Id
 	default:
 		return externalName

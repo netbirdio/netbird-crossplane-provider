@@ -148,9 +148,9 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	lookupID := resolvePolicyLookupID(cr)
 
 	// The external-name annotation is not guaranteed to hold a provider ID (older
-	// reconciles defaulted it to the object name, and compositions may stamp the
-	// netbird display name as an adoption hint). Try the lookup ID as an ID first,
-	// and on not-found fall back to adoption by Name.
+	// reconciles defaulted it to the object name, or it may hold a netbird display
+	// name used as an adoption hint). Try the lookup ID as an ID first, and on
+	// not-found fall back to adoption by Name.
 	var policy *nbapi.Policy
 	if lookupID != "" && lookupID != cr.Name && lookupID != cr.Spec.ForProvider.Name {
 		var err error
@@ -226,7 +226,7 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 // up by ID, falling back to the recorded provider ID when the external-name
 // annotation is missing, was defaulted to the Kubernetes object name by an older
 // reconcile (before WithInitializers disabled the NameAsExternalName default), or
-// holds the netbird display name stamped by a composition as an adoption hint.
+// holds the netbird display name used as an adoption hint.
 func resolvePolicyLookupID(cr *v1alpha1.NbPolicy) string {
 	externalName := meta.GetExternalName(cr)
 	statusID := ""

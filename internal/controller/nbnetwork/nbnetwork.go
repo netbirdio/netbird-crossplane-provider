@@ -150,7 +150,7 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	// The external-name annotation is not guaranteed to hold a provider ID:
 	// it may be empty (fresh MR), the object name (older reconciles before
 	// WithInitializers disabled NameAsExternalName), or the netbird display name
-	// (composition adoption hint). Try the lookup ID as an ID first, and on
+	// (used as an adoption hint). Try the lookup ID as an ID first, and on
 	// not-found fall back to adoption by Name.
 	var network *nbapi.Network
 	if lookupID != "" && lookupID != cr.Name && lookupID != cr.Spec.ForProvider.Name {
@@ -235,7 +235,7 @@ func resolveNetworkLookupID(cr *v1alpha1.NbNetwork) string {
 	case cr.Status.AtProvider.Id != "" && cr.Status.AtProvider.Id != externalName &&
 		(externalName == cr.GetName() || externalName == cr.Spec.ForProvider.Name):
 		// Recover when the external name holds the Kubernetes object name (older
-		// reconciles) or the netbird display name (composition adoption hint).
+		// reconciles) or the netbird display name (used as an adoption hint).
 		return cr.Status.AtProvider.Id
 	default:
 		return externalName

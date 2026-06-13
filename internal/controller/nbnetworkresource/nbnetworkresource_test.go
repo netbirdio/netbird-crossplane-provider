@@ -221,11 +221,11 @@ func TestObserve(t *testing.T) {
 		}
 	})
 
-	t.Run("CompositionStampedExternalNameAdoptsByName", func(t *testing.T) {
-		// Live us-2 wedge: the composition stamps crossplane.io/external-name with
-		// the netbird display name, the first Create succeeded remotely but the ID
-		// was never persisted. Observe must adopt the existing resource by name
-		// instead of reporting not-exists (which drives a duplicate Create).
+	t.Run("DisplayNameExternalNameAdoptsByName", func(t *testing.T) {
+		// external-name holds the netbird display name (an adoption hint); the first
+		// Create succeeded remotely but the ID was never persisted. Observe must
+		// adopt the existing resource by name instead of reporting not-exists (which
+		// drives a duplicate Create).
 		auth, srv := newFakeAuth(t, func(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case r.URL.Path == "/api/networks" && r.Method == http.MethodGet:
@@ -376,7 +376,7 @@ func TestIsNetworkResourceUpToDate(t *testing.T) {
 			Address:     "1.1.1.1/32",
 			Enabled:     true,
 			Description: strp("desc"),
-			Groups:      &[]v1alpha1.GroupMinimum{{Name: strp("bao-routers")}},
+			Groups:      &[]v1alpha1.GroupMinimum{{Name: strp("routers")}},
 		}
 		res := &nbapi.NetworkResource{
 			Id:          "real-id",
@@ -384,7 +384,7 @@ func TestIsNetworkResourceUpToDate(t *testing.T) {
 			Address:     "1.1.1.1/32",
 			Enabled:     true,
 			Description: strp("desc"),
-			Groups:      []nbapi.GroupMinimum{{Id: "g-1", Name: "bao-routers"}},
+			Groups:      []nbapi.GroupMinimum{{Id: "g-1", Name: "routers"}},
 		}
 		return spec, res
 	}
@@ -436,7 +436,7 @@ func TestUpdate(t *testing.T) {
 				w.Write([]byte(`[{"id":"net-1","name":"my-net"}]`))
 			case r.URL.Path == "/api/groups" && r.Method == http.MethodGet:
 				w.Header().Set("Content-Type", "application/json")
-				w.Write([]byte(`[{"id":"g-1","name":"bao-routers"}]`))
+				w.Write([]byte(`[{"id":"g-1","name":"routers"}]`))
 			case r.URL.Path == "/api/networks/net-1/resources/real-id" && r.Method == http.MethodPut:
 				w.WriteHeader(http.StatusInternalServerError)
 				w.Write([]byte(`{"message":"boom","code":500}`))
@@ -452,7 +452,7 @@ func TestUpdate(t *testing.T) {
 		meta.SetExternalName(cr, "real-id")
 		cr.Spec.ForProvider.Name = "my-res"
 		cr.Spec.ForProvider.NetworkName = "my-net"
-		cr.Spec.ForProvider.Groups = &[]v1alpha1.GroupMinimum{{Name: strp("bao-routers")}}
+		cr.Spec.ForProvider.Groups = &[]v1alpha1.GroupMinimum{{Name: strp("routers")}}
 
 		_, err := e.Update(context.Background(), cr)
 		if err == nil {
@@ -469,7 +469,7 @@ func TestResolveGroupIDs(t *testing.T) {
 	strp := func(s string) *string { return &s }
 	api := []nbapi.Group{
 		{Id: "g-all", Name: "All"},
-		{Id: "g-bao", Name: "bao-routers"},
+		{Id: "g-routers", Name: "routers"},
 	}
 	cases := map[string]struct {
 		spec    []v1alpha1.GroupMinimum
@@ -477,12 +477,12 @@ func TestResolveGroupIDs(t *testing.T) {
 		wantErr bool
 	}{
 		"by id wins over name": {
-			spec: []v1alpha1.GroupMinimum{{Id: strp("g-bao"), Name: strp("ignored")}},
-			want: []string{"g-bao"},
+			spec: []v1alpha1.GroupMinimum{{Id: strp("g-routers"), Name: strp("ignored")}},
+			want: []string{"g-routers"},
 		},
 		"by name resolves to api id": {
-			spec: []v1alpha1.GroupMinimum{{Name: strp("bao-routers")}},
-			want: []string{"g-bao"},
+			spec: []v1alpha1.GroupMinimum{{Name: strp("routers")}},
+			want: []string{"g-routers"},
 		},
 		"name nil falls through to error if id also nil": {
 			spec:    []v1alpha1.GroupMinimum{{}},

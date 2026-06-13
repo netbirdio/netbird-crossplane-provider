@@ -164,11 +164,11 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		return managed.ExternalObservation{}, errors.New("network name not found")
 	}
 
-	// The external-name annotation is not guaranteed to hold a provider ID:
-	// compositions stamp it with the desired netbird display name as an adoption
-	// hint, and the composite controller re-applies that value over whatever ID we
-	// record. Try the lookup ID as an ID first, and on not-found fall back to
-	// adoption by name within the parent network.
+	// The external-name annotation is not guaranteed to hold a provider ID: it may
+	// hold a desired netbird display name used as an adoption hint, which the
+	// managing controller can re-apply over whatever ID we record. Try the lookup
+	// ID as an ID first, and on not-found fall back to adoption by name within the
+	// parent network.
 	if lookupID != "" && lookupID != cr.Name && lookupID != cr.Spec.ForProvider.Name {
 		networkresource, err := client.Networks.Resources(apinetwork.Id).Get(ctx, lookupID)
 		switch {
@@ -276,8 +276,8 @@ func isNetworkResourceUpToDate(spec v1alpha1.NbNetworkResourceParameters, res *n
 // network resource up by ID, falling back to the recorded provider ID when the
 // external-name annotation is missing, was defaulted to the Kubernetes object
 // name by an older reconcile (before WithInitializers disabled the
-// NameAsExternalName default), or holds the netbird display name stamped by a
-// composition as an adoption hint.
+// NameAsExternalName default), or holds a netbird display name used as an
+// adoption hint.
 func resolveNetworkResourceLookupID(cr *v1alpha1.NbNetworkResource) string {
 	externalName := meta.GetExternalName(cr)
 	switch {

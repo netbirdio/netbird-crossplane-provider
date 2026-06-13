@@ -153,7 +153,7 @@ func TestObserve(t *testing.T) {
 				w.Write([]byte(`[]`))
 			case r.URL.Path == "/api/groups" && r.Method == http.MethodGet:
 				w.Header().Set("Content-Type", "application/json")
-				w.Write([]byte(`[{"id":"g-1","name":"bao-routers"}]`))
+				w.Write([]byte(`[{"id":"g-1","name":"routers"}]`))
 			default:
 				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 			}
@@ -163,7 +163,7 @@ func TestObserve(t *testing.T) {
 		e := external{authManager: auth}
 		cr := &v1alpha1.NbNetworkRouter{ObjectMeta: metav1.ObjectMeta{Name: "my-router"}}
 		cr.Spec.ForProvider.NetworkName = "my-net"
-		cr.Spec.ForProvider.PeerGroupName = "bao-routers"
+		cr.Spec.ForProvider.PeerGroupName = "routers"
 
 		obs, err := e.Observe(context.Background(), cr)
 		if err != nil {
@@ -221,7 +221,7 @@ func TestObserve(t *testing.T) {
 				w.Write([]byte(`[{"id":"r-other","enabled":true,"masquerade":true,"metric":9999,"peer_groups":["g-other"]}]`))
 			case r.URL.Path == "/api/groups" && r.Method == http.MethodGet:
 				w.Header().Set("Content-Type", "application/json")
-				w.Write([]byte(`[{"id":"g-1","name":"bao-routers"},{"id":"g-other","name":"other-routers"}]`))
+				w.Write([]byte(`[{"id":"g-1","name":"routers"},{"id":"g-other","name":"clients"}]`))
 			default:
 				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 			}
@@ -231,7 +231,7 @@ func TestObserve(t *testing.T) {
 		e := external{authManager: auth}
 		cr := &v1alpha1.NbNetworkRouter{ObjectMeta: metav1.ObjectMeta{Name: "my-router"}}
 		cr.Spec.ForProvider.NetworkName = "my-net"
-		cr.Spec.ForProvider.PeerGroupName = "bao-routers"
+		cr.Spec.ForProvider.PeerGroupName = "routers"
 
 		obs, err := e.Observe(context.Background(), cr)
 		if err != nil {
@@ -256,7 +256,7 @@ func TestObserve(t *testing.T) {
 				w.Write([]byte(`[{"id":"r-1","enabled":true,"masquerade":true,"metric":9999,"peer_groups":["g-1"]}]`))
 			case r.URL.Path == "/api/groups" && r.Method == http.MethodGet:
 				w.Header().Set("Content-Type", "application/json")
-				w.Write([]byte(`[{"id":"g-1","name":"bao-routers"}]`))
+				w.Write([]byte(`[{"id":"g-1","name":"routers"}]`))
 			default:
 				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 			}
@@ -267,7 +267,7 @@ func TestObserve(t *testing.T) {
 		cr := &v1alpha1.NbNetworkRouter{ObjectMeta: metav1.ObjectMeta{Name: "my-router"}}
 		meta.SetExternalName(cr, "stale-id")
 		cr.Spec.ForProvider.NetworkName = "my-net"
-		cr.Spec.ForProvider.PeerGroupName = "bao-routers"
+		cr.Spec.ForProvider.PeerGroupName = "routers"
 
 		obs, err := e.Observe(context.Background(), cr)
 		if err != nil {
@@ -379,7 +379,7 @@ func TestObserve(t *testing.T) {
 		meta.SetExternalName(cr, "my-router")
 		cr.Status.AtProvider.Id = "real-id"
 		cr.Spec.ForProvider.NetworkName = "my-net"
-		cr.Spec.ForProvider.PeerGroupName = "bao-routers"
+		cr.Spec.ForProvider.PeerGroupName = "routers"
 
 		obs, err := e.Observe(context.Background(), cr)
 		if err != nil {
