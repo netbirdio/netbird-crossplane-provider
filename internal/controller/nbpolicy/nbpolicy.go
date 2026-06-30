@@ -19,6 +19,7 @@ package nbpolicy
 import (
 	"context"
 	"reflect"
+	"strings"
 
 	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/pkg/connection"
@@ -35,7 +36,8 @@ import (
 	"github.com/crossplane/netbird-crossplane-provider/internal/features"
 	"github.com/go-logr/logr"
 	"github.com/google/go-cmp/cmp"
-	nbapi "github.com/netbirdio/netbird/management/server/http/api"
+	netbird "github.com/netbirdio/netbird/shared/management/client/rest"
+	nbapi "github.com/netbirdio/netbird/shared/management/http/api"
 	"github.com/pkg/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
@@ -67,6 +69,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 		managed.WithPollInterval(o.PollInterval),
 		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
 		managed.WithConnectionPublishers(cps...),
+		managed.WithInitializers(),
 	}
 	if o.Features.Enabled(feature.EnableBetaManagementPolicies) {
 		reconcilerOptions = append(reconcilerOptions, managed.WithManagementPolicies())
@@ -117,13 +120,19 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	}, nil
 }
 
-// An ExternalClient observes, then either creates, updates, or deletes an
-// external resource to ensure it reflects the managed resource's desired state.
+// authClient is the subset of the netbird auth manager used by this controller.
+type authClient interface {
+	GetClient(ctx context.Context) (*netbird.Client, error)
+	ForceRefresh(ctx context.Context) error
+}
+
+// external implements managed.ExternalClient for the NbPolicy managed resource.
 type external struct {
-	authManager *auth.AuthManager
+	authManager authClient
 	log         logr.Logger
 }
 
+// Observe checks whether the NbPolicy currently exists in netbird and updates status.
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
 	cr, ok := mg.(*v1alpha1.NbPolicy)
 	if !ok {
@@ -136,24 +145,50 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	c.log.Info("Observing", "cr", cr)
 
 	externalName := meta.GetExternalName(cr)
-	// Adoption pattern: if externalName is blank or matches cr.Name, try to find by Name
-	if externalName == "" || externalName == cr.Name {
-		c.log.Info("external name blank or matches resource name, attempting adoption by Name", "name", cr.Spec.ForProvider.Name)
+	lookupID := resolvePolicyLookupID(cr)
+
+	// The external-name annotation is not guaranteed to hold a provider ID (older
+	// reconciles defaulted it to the object name, or it may hold a netbird display
+	// name used as an adoption hint). Try the lookup ID as an ID first, and on
+	// not-found fall back to adoption by Name.
+	var policy *nbapi.Policy
+	if lookupID != "" && lookupID != cr.Name && lookupID != cr.Spec.ForProvider.Name {
+		var err error
+		policy, err = client.Policies.Get(ctx, lookupID)
+		if err != nil {
+			if auth.IsTokenInvalidError(err) {
+				c.authManager.ForceRefresh(ctx)
+				return managed.ExternalObservation{}, err
+			}
+			if !isPolicyNotFoundError(err) {
+				// Don't swallow transient errors — Crossplane should requeue, not call Create.
+				return managed.ExternalObservation{}, errors.Wrapf(err, "failed to observe policy %q", lookupID)
+			}
+			c.log.Info("policy not found by id, attempting adoption by name", "lookup-id", lookupID)
+		}
+	}
+	if policy == nil {
+		// Adoption by Name: the netbird policy may exist even though we hold no
+		// usable ID (fresh MR, or a Create whose external-name persist failed).
+		c.log.Info("attempting adoption by Name", "name", cr.Spec.ForProvider.Name)
 		policies, err := client.Policies.List(ctx)
 		if err != nil {
 			if auth.IsTokenInvalidError(err) {
 				c.authManager.ForceRefresh(ctx)
 				return managed.ExternalObservation{}, err
 			}
-			c.log.Info("failed to list policies")
-			return managed.ExternalObservation{
-				ResourceExists: false,
-			}, nil //return nil so that observe can return without error so that it passes to create.
+			return managed.ExternalObservation{}, errors.Wrap(err, "failed to list policies for adoption")
 		}
 		for _, apipolicy := range policies {
 			if apipolicy.Name == cr.Spec.ForProvider.Name {
 				c.log.Info("found existing policy for adoption", "policyid", apipolicy.Id)
-				meta.SetExternalName(cr, *apipolicy.Id)
+				if apipolicy.Id != nil {
+					meta.SetExternalName(cr, *apipolicy.Id)
+				}
+				// Identity is persisted via status.atProvider.id (external-name set
+				// during Observe is not persisted by the runtime), which the lookup
+				// resolver prefers on subsequent reconciles.
+				cr.Status.AtProvider.Id = apipolicy.Id
 				return managed.ExternalObservation{
 					ResourceExists:   true,
 					ResourceUpToDate: false, // force a requeue for a fresh Observe
@@ -164,17 +199,11 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
 
-	policy, err := client.Policies.Get(ctx, externalName)
-	if err != nil {
-		if auth.IsTokenInvalidError(err) {
-			c.authManager.ForceRefresh(ctx)
-			return managed.ExternalObservation{}, err
-		}
-		c.log.Info("failed to get policy")
-		return managed.ExternalObservation{
-			ResourceExists: false,
-		}, nil //return nil so that observe can return without error so that it passes to create.
+	// Repair stale or missing external-name annotations after recovering via status ID.
+	if policy.Id != nil && externalName != *policy.Id {
+		meta.SetExternalName(cr, *policy.Id)
 	}
+
 	uptodate := IsApiToNBPolicyUpToDate(cr.Spec.ForProvider, policy, c)
 	cr.Status.AtProvider = v1alpha1.NbPolicyObservation{
 		Id:                  policy.Id,
@@ -191,6 +220,38 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		ResourceExists:   true,
 		ResourceUpToDate: uptodate,
 	}, nil
+}
+
+// resolvePolicyLookupID picks the best identifier to use when looking the policy
+// up by ID, falling back to the recorded provider ID when the external-name
+// annotation is missing, was defaulted to the Kubernetes object name by an older
+// reconcile (before WithInitializers disabled the NameAsExternalName default), or
+// holds the netbird display name used as an adoption hint.
+func resolvePolicyLookupID(cr *v1alpha1.NbPolicy) string {
+	externalName := meta.GetExternalName(cr)
+	statusID := ""
+	if cr.Status.AtProvider.Id != nil {
+		statusID = *cr.Status.AtProvider.Id
+	}
+	switch {
+	case externalName == "":
+		return statusID
+	case statusID != "" && statusID != externalName &&
+		(externalName == cr.GetName() || externalName == cr.Spec.ForProvider.Name):
+		return statusID
+	default:
+		return externalName
+	}
+}
+
+// isPolicyNotFoundError matches the "policy: <id> not found" / "policy not found"
+// messages returned by the netbird REST API for a missing policy.
+func isPolicyNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "policy") && strings.Contains(errStr, "not found")
 }
 
 func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
@@ -241,7 +302,10 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 		return managed.ExternalUpdate{}, errors.Wrap(err, "failed to get authenticated client")
 	}
 	c.log.Info("Updating", "cr", cr)
-	policyid := meta.GetExternalName(cr)
+	policyid := resolvePolicyLookupID(cr)
+	if policyid == "" {
+		return managed.ExternalUpdate{}, errors.New("can't find policy id")
+	}
 	groups, err := client.Groups.List(ctx)
 	if err != nil {
 		return managed.ExternalUpdate{
@@ -258,13 +322,16 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 			ConnectionDetails: managed.ConnectionDetails{},
 		}, err
 	}
-	client.Policies.Update(ctx, policyid, nbapi.PutApiPoliciesPolicyIdJSONRequestBody{
+	_, err = client.Policies.Update(ctx, policyid, nbapi.PutApiPoliciesPolicyIdJSONRequestBody{
 		Name:                cr.Spec.ForProvider.Name,
 		Description:         cr.Spec.ForProvider.Description,
 		Enabled:             cr.Spec.ForProvider.Enabled,
 		SourcePostureChecks: cr.Spec.ForProvider.SourcePostureChecks,
 		Rules:               rules,
 	})
+	if err != nil {
+		return managed.ExternalUpdate{}, errors.Wrapf(err, "failed to update policy %q", policyid)
+	}
 	return managed.ExternalUpdate{
 		// Optionally return any details that may be required to connect to the
 		// external resource. These will be stored as the connection secret.
@@ -282,7 +349,10 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 		return errors.Wrap(err, "failed to get authenticated client")
 	}
 	c.log.Info("Deleting", "cr", cr)
-	policyid := meta.GetExternalName(cr)
+	policyid := resolvePolicyLookupID(cr)
+	if policyid == "" {
+		return errors.New("can't find policy id")
+	}
 	return client.Policies.Delete(ctx, policyid)
 }
 

@@ -7,3 +7,5 @@ cover.out
 .vscode
 .idea
 .DS_Store
+/bin
+/up

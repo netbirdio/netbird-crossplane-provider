@@ -39,7 +39,7 @@ import (
 	"github.com/crossplane/netbird-crossplane-provider/apis/vpn/v1alpha1"
 	auth "github.com/crossplane/netbird-crossplane-provider/internal/controller/nb"
 	"github.com/crossplane/netbird-crossplane-provider/internal/features"
-	"github.com/netbirdio/netbird/management/server/http/api"
+	"github.com/netbirdio/netbird/shared/management/http/api"
 )
 
 const (
@@ -132,10 +132,8 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 			c.authManager.ForceRefresh(ctx)
 			return managed.ExternalObservation{}, err
 		}
-		c.log.Info("failed to list accounts")
-		return managed.ExternalObservation{
-			ResourceExists: false,
-		}, nil //return nil so that observe can return without error so that it passes to create.
+		// Don't swallow transient errors — Crossplane should requeue, not call Create.
+		return managed.ExternalObservation{}, errors.Wrap(err, "failed to list accounts")
 	}
 
 	accountusers, err := client.Users.List(ctx)
@@ -144,10 +142,7 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 			c.authManager.ForceRefresh(ctx)
 			return managed.ExternalObservation{}, err
 		}
-		c.log.Info("failed to list users")
-		return managed.ExternalObservation{
-			ResourceExists: false,
-		}, nil //return nil so that observe can return without error so that it passes to create.
+		return managed.ExternalObservation{}, errors.Wrap(err, "failed to list users for account observation")
 	}
 
 	allgroups, err := client.Groups.List(ctx)
@@ -156,10 +151,7 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 			c.authManager.ForceRefresh(ctx)
 			return managed.ExternalObservation{}, err
 		}
-		c.log.Info("failed to list groups")
-		return managed.ExternalObservation{
-			ResourceExists: false,
-		}, nil //return nil so that observe can return without error so that it passes to create.
+		return managed.ExternalObservation{}, errors.Wrap(err, "failed to list groups for account observation")
 	}
 
 	account := accounts[0]
@@ -192,6 +184,14 @@ func isUpToDate(nbaccount v1alpha1.NbAccount, apiaccount api.Account, c *externa
 	}
 	if !cmp.Equal(nbaccount.Spec.ForProvider.Settings.Extra.PeerApprovalEnabled, apiaccount.Settings.Extra.PeerApprovalEnabled) {
 		c.log.Info("extra settings PeerApprovalEnabled not equal")
+		return false
+	}
+	if !cmp.Equal(nbaccount.Spec.ForProvider.Settings.Extra.UserApprovalRequired, apiaccount.Settings.Extra.UserApprovalRequired) {
+		c.log.Info("extra settings UserApprovalRequired not equal")
+		return false
+	}
+	if !stringSlicesEqual(nbaccount.Spec.ForProvider.Settings.Extra.NetworkTrafficLogsGroups, apiaccount.Settings.Extra.NetworkTrafficLogsGroups) {
+		c.log.Info("extra settings NetworkTrafficLogsGroups not equal")
 		return false
 	}
 	if !cmp.Equal(nbaccount.Spec.ForProvider.Settings.GroupsPropagationEnabled, *apiaccount.Settings.GroupsPropagationEnabled) {
@@ -287,9 +287,39 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 	return nil
 }
 
+// stringSlicesEqual compares two string slices, treating nil and empty as equal.
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ApitoNbAccountExtraSettings maps the netbird API extra-settings model into the
+// local CRD representation. Explicit field mapping (rather than a struct cast)
+// keeps the two types decoupled so upstream additions to AccountExtraSettings
+// can't silently break the conversion.
+func ApitoNbAccountExtraSettings(p *api.AccountExtraSettings) *v1alpha1.AccountExtraSettings {
+	if p == nil {
+		return nil
+	}
+	return &v1alpha1.AccountExtraSettings{
+		NetworkTrafficLogsEnabled:          p.NetworkTrafficLogsEnabled,
+		NetworkTrafficLogsGroups:           p.NetworkTrafficLogsGroups,
+		NetworkTrafficPacketCounterEnabled: p.NetworkTrafficPacketCounterEnabled,
+		PeerApprovalEnabled:                p.PeerApprovalEnabled,
+		UserApprovalRequired:               p.UserApprovalRequired,
+	}
+}
+
 func ApitoNbAccountSettings(p api.AccountSettings) *v1alpha1.AccountSettings {
 	accountsettings := v1alpha1.AccountSettings{
-		Extra:                           (*v1alpha1.AccountExtraSettings)(p.Extra),
+		Extra:                           ApitoNbAccountExtraSettings(p.Extra),
 		GroupsPropagationEnabled:        *p.GroupsPropagationEnabled,
 		JwtAllowGroups:                  *p.JwtAllowGroups,
 		JwtGroupsClaimName:              *p.JwtGroupsClaimName,
@@ -307,8 +337,10 @@ func ApitoNbAccountSettings(p api.AccountSettings) *v1alpha1.AccountSettings {
 func NbToApiAccountSettings(p v1alpha1.AccountSettings) *api.AccountSettings {
 	extrasettings := api.AccountExtraSettings{
 		NetworkTrafficLogsEnabled:          p.Extra.NetworkTrafficLogsEnabled,
+		NetworkTrafficLogsGroups:           p.Extra.NetworkTrafficLogsGroups,
 		NetworkTrafficPacketCounterEnabled: p.Extra.NetworkTrafficPacketCounterEnabled,
 		PeerApprovalEnabled:                p.Extra.PeerApprovalEnabled,
+		UserApprovalRequired:               p.Extra.UserApprovalRequired,
 	}
 	accountsettings := api.AccountSettings{
 		Extra:                           &extrasettings,

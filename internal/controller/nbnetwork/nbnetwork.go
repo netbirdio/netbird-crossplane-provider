@@ -35,8 +35,8 @@ import (
 	"github.com/crossplane/netbird-crossplane-provider/internal/features"
 	"github.com/go-logr/logr"
 	"github.com/google/go-cmp/cmp"
-	netbird "github.com/netbirdio/netbird/management/client/rest"
-	nbapi "github.com/netbirdio/netbird/management/server/http/api"
+	netbird "github.com/netbirdio/netbird/shared/management/client/rest"
+	nbapi "github.com/netbirdio/netbird/shared/management/http/api"
 	"github.com/pkg/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
@@ -147,21 +147,35 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	externalName := meta.GetExternalName(cr)
 	lookupID := resolveNetworkLookupID(cr)
 
-	// Adoption pattern: if we don't yet have a stable provider ID, try to find by Name.
-	// lookupID == "" covers a fresh resource with no external name and no status ID.
-	// lookupID == cr.Name covers older reconciles that defaulted external-name to the k8s
-	// object name without ever recording a real status ID.
-	if lookupID == "" || lookupID == cr.Name {
+	// The external-name annotation is not guaranteed to hold a provider ID:
+	// it may be empty (fresh MR), the object name (older reconciles before
+	// WithInitializers disabled NameAsExternalName), or the netbird display name
+	// (used as an adoption hint). Try the lookup ID as an ID first, and on
+	// not-found fall back to adoption by Name.
+	var network *nbapi.Network
+	if lookupID != "" && lookupID != cr.Name && lookupID != cr.Spec.ForProvider.Name {
+		network, err = client.Networks.Get(ctx, lookupID)
+		if err != nil {
+			if auth.IsTokenInvalidError(err) {
+				c.authManager.ForceRefresh(ctx)
+				return managed.ExternalObservation{}, err
+			}
+			if !isNetworkNotFoundError(err) {
+				// Don't swallow transient errors — Crossplane should requeue, not call Create.
+				return managed.ExternalObservation{}, errors.Wrapf(err, "failed to observe network %q", lookupID)
+			}
+			c.log.Info("network not found by id, attempting adoption by name", "lookup-id", lookupID)
+		}
+	}
+	if network == nil {
 		networks, err := client.Networks.List(ctx)
 		if err != nil {
 			if auth.IsTokenInvalidError(err) {
 				c.authManager.ForceRefresh(ctx)
 				return managed.ExternalObservation{}, err
 			}
-			c.log.Info("failed to list networks")
-			return managed.ExternalObservation{
-				ResourceExists: false,
-			}, nil //return nil so that observe can return without error so that it passes to create.
+			// Don't swallow transient errors — a failed list must not look like "doesn't exist".
+			return managed.ExternalObservation{}, errors.Wrap(err, "failed to list networks for adoption")
 		}
 		for _, net := range networks {
 			if net.Name == cr.Spec.ForProvider.Name {
@@ -184,23 +198,6 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		}
 		// Not found by name, treat as not existing
 		return managed.ExternalObservation{ResourceExists: false}, nil
-	}
-
-	// If we have a resolved lookup ID, fetch by ID.
-	network, err := client.Networks.Get(ctx, lookupID)
-	if err != nil {
-		if auth.IsTokenInvalidError(err) {
-			c.authManager.ForceRefresh(ctx)
-			return managed.ExternalObservation{}, err
-		}
-		if isNetworkNotFoundError(err) {
-			c.log.Info("network not found", "lookup-id", lookupID)
-			return managed.ExternalObservation{
-				ResourceExists: false,
-			}, nil
-		}
-		// Don't swallow transient errors — Crossplane should requeue, not call Create.
-		return managed.ExternalObservation{}, errors.Wrapf(err, "failed to observe network %q", lookupID)
 	}
 
 	// Repair stale or missing external-name annotations after recovering via status ID.
@@ -235,8 +232,10 @@ func resolveNetworkLookupID(cr *v1alpha1.NbNetwork) string {
 	switch {
 	case externalName == "":
 		return cr.Status.AtProvider.Id
-	case cr.Status.AtProvider.Id != "" && externalName == cr.GetName() && cr.Status.AtProvider.Id != externalName:
-		// Recover from older reconciles that defaulted the external name to the Kubernetes object name.
+	case cr.Status.AtProvider.Id != "" && cr.Status.AtProvider.Id != externalName &&
+		(externalName == cr.GetName() || externalName == cr.Spec.ForProvider.Name):
+		// Recover when the external name holds the Kubernetes object name (older
+		// reconciles) or the netbird display name (used as an adoption hint).
 		return cr.Status.AtProvider.Id
 	default:
 		return externalName

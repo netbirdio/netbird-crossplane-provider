@@ -18,6 +18,7 @@ package nbsetupkey
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -38,7 +39,8 @@ import (
 	"github.com/crossplane/netbird-crossplane-provider/apis/vpn/v1alpha1"
 	auth "github.com/crossplane/netbird-crossplane-provider/internal/controller/nb"
 	"github.com/crossplane/netbird-crossplane-provider/internal/features"
-	"github.com/netbirdio/netbird/management/server/http/api"
+	netbird "github.com/netbirdio/netbird/shared/management/client/rest"
+	"github.com/netbirdio/netbird/shared/management/http/api"
 )
 
 const (
@@ -68,6 +70,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 		managed.WithPollInterval(o.PollInterval),
 		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
 		managed.WithConnectionPublishers(cps...),
+		managed.WithInitializers(),
 	}
 	if o.Features.Enabled(feature.EnableBetaManagementPolicies) {
 		reconcilerOptions = append(reconcilerOptions, managed.WithManagementPolicies())
@@ -119,13 +122,19 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	}, nil
 }
 
-// An ExternalClient observes, then either creates, updates, or deletes an
-// external resource to ensure it reflects the managed resource's desired state.
+// authClient is the subset of the netbird auth manager used by this controller.
+type authClient interface {
+	GetClient(ctx context.Context) (*netbird.Client, error)
+	ForceRefresh(ctx context.Context) error
+}
+
+// external implements managed.ExternalClient for the NbSetupKey managed resource.
 type external struct {
-	authManager *auth.AuthManager
+	authManager authClient
 	log         logr.Logger
 }
 
+// Observe checks whether the NbSetupKey currently exists in netbird and updates status.
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
 	cr, ok := mg.(*v1alpha1.NbSetupKey)
 	if !ok {
@@ -137,22 +146,64 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	}
 	c.log.Info("Observing", "cr", cr)
 	externalName := meta.GetExternalName(cr)
+	lookupID := resolveSetupKeyLookupID(cr)
 
-	if externalName == "" {
+	// The lookup ID may be empty (fresh MR, or Update cleared both external-name and
+	// status.AtProvider.Id when rotating a revoked/expired key) or hold a non-ID
+	// value (object name or display-name adoption hint). Try it as an ID
+	// first, and otherwise fall back to adoption by Name so a Create whose
+	// external-name persist failed doesn't mint a duplicate key.
+	var setupkey *api.SetupKey
+	if lookupID != "" && lookupID != cr.Name && lookupID != cr.Spec.ForProvider.Name {
+		var err error
+		setupkey, err = client.SetupKeys.Get(ctx, lookupID)
+		if err != nil {
+			if auth.IsTokenInvalidError(err) {
+				c.authManager.ForceRefresh(ctx)
+				return managed.ExternalObservation{}, err
+			}
+			if !isSetupKeyNotFoundError(err) {
+				// Don't swallow transient errors — Crossplane should requeue, not mint a duplicate key.
+				return managed.ExternalObservation{}, errors.Wrapf(err, "failed to observe setup key %q", lookupID)
+			}
+			c.log.Info("setup key not found by id, attempting adoption by name", "lookup-id", lookupID)
+		}
+	}
+	if setupkey == nil {
+		// Adoption by Name. Only valid keys are adopted: a revoked or expired key
+		// with a matching name is rotation leftover, and a deleted-but-still-listed
+		// key must not be re-adopted or rotation would never converge on Create.
+		keys, err := client.SetupKeys.List(ctx)
+		if err != nil {
+			if auth.IsTokenInvalidError(err) {
+				c.authManager.ForceRefresh(ctx)
+				return managed.ExternalObservation{}, err
+			}
+			// Don't swallow transient errors — a failed list must not look like "doesn't exist".
+			return managed.ExternalObservation{}, errors.Wrap(err, "failed to list setup keys for adoption")
+		}
+		for _, key := range keys {
+			if key.Name == cr.Spec.ForProvider.Name && !key.Revoked && key.Expires.After(time.Now()) {
+				c.log.Info("adopting existing setup key", "setup-key-id", key.Id)
+				meta.SetExternalName(cr, key.Id)
+				// Identity is persisted via status.atProvider.id (external-name set
+				// during Observe is not persisted by the runtime), which the lookup
+				// resolver prefers. Report up-to-date: Update would rotate (delete)
+				// the key, which must stay reserved for the expired/revoked path.
+				cr.Status.AtProvider.Id = key.Id
+				cr.Status.SetConditions(xpv1.Available())
+				return managed.ExternalObservation{
+					ResourceExists:   true,
+					ResourceUpToDate: true,
+				}, nil
+			}
+		}
 		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
 
-	// If we have an external name, fetch by ID
-	setupkey, err := client.SetupKeys.Get(ctx, externalName)
-	if err != nil {
-		if auth.IsTokenInvalidError(err) {
-			c.authManager.ForceRefresh(ctx)
-			return managed.ExternalObservation{}, err
-		}
-		c.log.Info("setupkey not found")
-		return managed.ExternalObservation{
-			ResourceExists: false,
-		}, nil //return nil so that observe can return without error so that it passes to create.
+	// Repair stale or missing external-name annotations after recovering via status ID.
+	if externalName != setupkey.Id {
+		meta.SetExternalName(cr, setupkey.Id)
 	}
 
 	if setupkey.Expires.Before(time.Now()) || setupkey.Revoked {
@@ -182,6 +233,35 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		ResourceUpToDate:  true,
 		ConnectionDetails: managed.ConnectionDetails{},
 	}, nil
+}
+
+// resolveSetupKeyLookupID picks the best identifier to use when looking the setup
+// key up by ID, falling back to the recorded provider ID when the external-name
+// annotation is missing or was defaulted to the Kubernetes object name by an
+// older reconcile (before WithInitializers disabled the NameAsExternalName default).
+func resolveSetupKeyLookupID(cr *v1alpha1.NbSetupKey) string {
+	externalName := meta.GetExternalName(cr)
+	switch {
+	case externalName == "":
+		return cr.Status.AtProvider.Id
+	case cr.Status.AtProvider.Id != "" && cr.Status.AtProvider.Id != externalName &&
+		(externalName == cr.GetName() || externalName == cr.Spec.ForProvider.Name):
+		// Recover when the external name holds the Kubernetes object name (older
+		// reconciles) or the netbird display name (used as an adoption hint).
+		return cr.Status.AtProvider.Id
+	default:
+		return externalName
+	}
+}
+
+// isSetupKeyNotFoundError matches the "setup key: <id> not found" message
+// returned by the netbird REST API for a missing setup key.
+func isSetupKeyNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "setup key") && strings.Contains(errStr, "not found")
 }
 
 // func isUpToDate(nbSetupKeyParameters *v1alpha1.NbSetupKeyParameters, setupkey *api.SetupKey, log logr.Logger) bool {
@@ -243,14 +323,18 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 		return managed.ExternalUpdate{}, errors.Wrap(err, "failed to get authenticated client")
 	}
 	c.log.Info("Updating", "cr", cr)
-	setupKeyId := meta.GetExternalName(cr)
+	setupKeyId := resolveSetupKeyLookupID(cr)
 	if setupKeyId == "" {
 		return managed.ExternalUpdate{}, errors.New("can't find setupKeyId")
 	}
 	if err := client.SetupKeys.Delete(ctx, setupKeyId); err != nil {
 		return managed.ExternalUpdate{}, errors.Wrap(err, "failed to delete expired setupkey")
 	}
+	// Clear both external-name and the recorded provider ID so the next Observe
+	// resolves to "" and drives Create — without clearing status, the resolver
+	// would fall back to a now-deleted ID.
 	meta.SetExternalName(cr, "")
+	cr.Status.AtProvider.Id = ""
 	return managed.ExternalUpdate{
 		ConnectionDetails: managed.ConnectionDetails{},
 	}, nil
@@ -267,7 +351,11 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 	}
 	c.log.Info("Deleting", "cr", cr)
 
-	err = client.SetupKeys.Delete(ctx, meta.GetExternalName(cr))
+	setupKeyId := resolveSetupKeyLookupID(cr)
+	if setupKeyId == "" {
+		return errors.New("can't find setupKeyId")
+	}
+	err = client.SetupKeys.Delete(ctx, setupKeyId)
 	if err != nil {
 		return err
 	}

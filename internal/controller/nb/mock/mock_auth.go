@@ -5,7 +5,7 @@ import (
 	"sync"
 
 	"github.com/go-logr/logr"
-	"github.com/netbirdio/netbird/management/client/rest"
+	"github.com/netbirdio/netbird/shared/management/client/rest"
 	"github.com/pkg/errors"
 )
 

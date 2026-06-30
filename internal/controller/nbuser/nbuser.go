@@ -39,7 +39,8 @@ import (
 	"github.com/crossplane/netbird-crossplane-provider/apis/vpn/v1alpha1"
 	auth "github.com/crossplane/netbird-crossplane-provider/internal/controller/nb"
 	"github.com/crossplane/netbird-crossplane-provider/internal/features"
-	nbapi "github.com/netbirdio/netbird/management/server/http/api"
+	netbird "github.com/netbirdio/netbird/shared/management/client/rest"
+	nbapi "github.com/netbirdio/netbird/shared/management/http/api"
 )
 
 const (
@@ -69,6 +70,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 		managed.WithPollInterval(o.PollInterval),
 		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
 		managed.WithConnectionPublishers(cps...),
+		managed.WithInitializers(),
 	}
 	if o.Features.Enabled(feature.EnableBetaManagementPolicies) {
 		reconcilerOptions = append(reconcilerOptions, managed.WithManagementPolicies())
@@ -120,13 +122,19 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	}, nil
 }
 
-// An ExternalClient observes, then either creates, updates, or deletes an
-// external resource to ensure it reflects the managed resource's desired state.
+// authClient is the subset of the netbird auth manager used by this controller.
+type authClient interface {
+	GetClient(ctx context.Context) (*netbird.Client, error)
+	ForceRefresh(ctx context.Context) error
+}
+
+// external implements managed.ExternalClient for the NbUser managed resource.
 type external struct {
-	authManager *auth.AuthManager
+	authManager authClient
 	log         logr.Logger
 }
 
+// Observe checks whether the NbUser currently exists in netbird and updates status.
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
 	cr, ok := mg.(*v1alpha1.NbUser)
 	if !ok {
@@ -139,8 +147,10 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	c.log.Info("observing", "cr", cr)
 
 	externalName := meta.GetExternalName(cr)
-	// Adoption pattern: handle each case separately
-	if externalName == "" || externalName == cr.Name {
+	lookupID := resolveUserLookupID(cr)
+
+	// Adoption pattern: if we don't yet have a stable provider ID, try to find by Email or Name.
+	if lookupID == "" || lookupID == cr.Name {
 		c.log.Info("external name blank or matches resource name, attempting adoption by Email or Name")
 		users, err := client.Users.List(ctx)
 		if err != nil {
@@ -148,10 +158,7 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 				c.authManager.ForceRefresh(ctx)
 				return managed.ExternalObservation{}, err
 			}
-			c.log.Info("failed to list users")
-			return managed.ExternalObservation{
-				ResourceExists: false,
-			}, nil //return nil so that observe can return without error so that it passes to create.
+			return managed.ExternalObservation{}, errors.Wrap(err, "failed to list users for adoption")
 		}
 		var apiuser *nbapi.User
 		if !*cr.Spec.ForProvider.IsServiceUser {
@@ -190,11 +197,10 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 				ResourceUpToDate: IsUserUpToDate(cr.Spec.ForProvider, *apiuser),
 			}, nil
 		}
-		// Not found, resource does not exist
 		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
 
-	if externalName == cr.Spec.ForProvider.Name {
+	if lookupID == cr.Spec.ForProvider.Name {
 		// Only check for existence, do not set external name
 		c.log.Info("external name matches ForProvider.Name, checking existence only", "name", cr.Spec.ForProvider.Name)
 		users, err := client.Users.List(ctx)
@@ -203,14 +209,11 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 				c.authManager.ForceRefresh(ctx)
 				return managed.ExternalObservation{}, err
 			}
-			c.log.Info("failed to list users")
-			return managed.ExternalObservation{
-				ResourceExists: false,
-			}, nil //return nil so that observe can return without error so that it passes to create.
+			return managed.ExternalObservation{}, errors.Wrap(err, "failed to list users by ForProvider.Name")
 		}
 		var apiuser *nbapi.User
 		for _, user := range users {
-			if user.Name == externalName {
+			if user.Name == lookupID {
 				apiuser = &user
 				break
 			}
@@ -237,30 +240,35 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
 
-	// If externalName is set, fetch by ID as usual
+	// By-ID branch: the netbird REST SDK exposes Users.List but not Users.Get,
+	// so we list and filter locally. List errors must propagate as wrapped
+	// errors — otherwise transient backend failures would silently drive Create
+	// on the next reconcile, minting a duplicate service user.
 	users, err := client.Users.List(ctx)
 	if err != nil {
 		if auth.IsTokenInvalidError(err) {
 			c.authManager.ForceRefresh(ctx)
 			return managed.ExternalObservation{}, err
 		}
-		c.log.Info("failed to list users")
-		return managed.ExternalObservation{
-			ResourceExists: false,
-		}, nil //return nil so that observe can return without error so that it passes to create.
+		return managed.ExternalObservation{}, errors.Wrapf(err, "failed to list users for lookup %q", lookupID)
 	}
 	var user *nbapi.User
 	for _, u := range users {
-		if u.Id == externalName {
+		if u.Id == lookupID {
 			user = &u
 			break
 		}
 	}
 	if user == nil {
-		c.log.Error(nil, "user not found by externalName", "externalName", externalName)
+		c.log.Info("user not found by lookup id", "lookup-id", lookupID)
 		return managed.ExternalObservation{
 			ResourceExists: false,
 		}, nil
+	}
+
+	// Repair stale or missing external-name annotations after recovering via status ID.
+	if externalName != user.Id {
+		meta.SetExternalName(cr, user.Id)
 	}
 
 	cr.Status.AtProvider = v1alpha1.NbUserObservation{
@@ -280,6 +288,23 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		ResourceExists:   true,
 		ResourceUpToDate: IsUserUpToDate(cr.Spec.ForProvider, *user),
 	}, nil
+}
+
+// resolveUserLookupID picks the best identifier to use when looking the user up
+// by ID, falling back to the recorded provider ID when the external-name
+// annotation is missing or was defaulted to the Kubernetes object name by an
+// older reconcile (before WithInitializers disabled the NameAsExternalName default).
+func resolveUserLookupID(cr *v1alpha1.NbUser) string {
+	externalName := meta.GetExternalName(cr)
+	switch {
+	case externalName == "":
+		return cr.Status.AtProvider.Id
+	case cr.Status.AtProvider.Id != "" && externalName == cr.GetName() && cr.Status.AtProvider.Id != externalName:
+		// Recover from older reconciles that defaulted the external name to the Kubernetes object name.
+		return cr.Status.AtProvider.Id
+	default:
+		return externalName
+	}
 }
 
 func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
@@ -321,7 +346,11 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 		return managed.ExternalUpdate{}, errors.Wrap(err, "failed to get authenticated client")
 	}
 	c.log.Info("Updating", "cr", cr)
-	_, err = client.Users.Update(ctx, meta.GetExternalName(cr), nbapi.PutApiUsersUserIdJSONRequestBody{
+	userid := resolveUserLookupID(cr)
+	if userid == "" {
+		return managed.ExternalUpdate{}, errors.New("can't find user id")
+	}
+	_, err = client.Users.Update(ctx, userid, nbapi.PutApiUsersUserIdJSONRequestBody{
 		Role:       cr.Spec.ForProvider.Role,
 		AutoGroups: *cr.Status.AtProvider.AutoGroups,
 		IsBlocked:  false,
@@ -347,7 +376,11 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 	}
 	c.log.Info("Deleting", "cr", cr)
 	if *cr.Spec.ForProvider.IsServiceUser {
-		return client.Users.Delete(ctx, meta.GetExternalName(cr))
+		userid := resolveUserLookupID(cr)
+		if userid == "" {
+			return errors.New("can't find user id")
+		}
+		return client.Users.Delete(ctx, userid)
 	}
 	return nil
 }

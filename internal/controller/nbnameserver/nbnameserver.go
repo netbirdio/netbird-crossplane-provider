@@ -19,6 +19,7 @@ package nbnameserver
 import (
 	"context"
 	"reflect"
+	"strings"
 
 	"github.com/go-logr/logr"
 	"github.com/google/go-cmp/cmp"
@@ -39,7 +40,8 @@ import (
 	"github.com/crossplane/netbird-crossplane-provider/apis/vpn/v1alpha1"
 	auth "github.com/crossplane/netbird-crossplane-provider/internal/controller/nb"
 	"github.com/crossplane/netbird-crossplane-provider/internal/features"
-	nbapi "github.com/netbirdio/netbird/management/server/http/api"
+	netbird "github.com/netbirdio/netbird/shared/management/client/rest"
+	nbapi "github.com/netbirdio/netbird/shared/management/http/api"
 )
 
 const (
@@ -66,6 +68,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 		managed.WithPollInterval(o.PollInterval),
 		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
 		managed.WithConnectionPublishers(cps...),
+		managed.WithInitializers(),
 	}
 
 	if o.Features.Enabled(feature.EnableBetaManagementPolicies) {
@@ -111,11 +114,19 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	}, nil
 }
 
+// authClient is the subset of the netbird auth manager used by this controller.
+type authClient interface {
+	GetClient(ctx context.Context) (*netbird.Client, error)
+	ForceRefresh(ctx context.Context) error
+}
+
+// external implements managed.ExternalClient for the NbNameServer managed resource.
 type external struct {
-	authManager *auth.AuthManager
+	authManager authClient
 	log         logr.Logger
 }
 
+// Observe checks whether the NbNameServer currently exists in netbird and updates status.
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
 	cr, ok := mg.(*v1alpha1.NbNameServer)
 	if !ok {
@@ -127,12 +138,35 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		return managed.ExternalObservation{}, errors.Wrap(err, "failed to get authenticated client")
 	}
 
-	// If externalName is empty, try to find the resource by Name (adoption pattern)
 	externalName := meta.GetExternalName(cr)
-	if externalName == "" || externalName == cr.Name {
-		// Attempt to find the resource by unique name
+	lookupID := resolveNameServerLookupID(cr)
+
+	// The external-name annotation is not guaranteed to hold a provider ID:
+	// it may be empty (fresh MR), the object name (older reconciles), or the
+	// netbird display name (used as an adoption hint). Try the lookup ID as an
+	// ID first, and on not-found fall back to adoption by Name.
+	var nameservergroup *nbapi.NameserverGroup
+	if lookupID != "" && lookupID != cr.Name && lookupID != cr.Spec.ForProvider.Name {
+		nameservergroup, err = client.DNS.GetNameserverGroup(ctx, lookupID)
+		if err != nil {
+			if auth.IsTokenInvalidError(err) {
+				c.authManager.ForceRefresh(ctx)
+				return managed.ExternalObservation{}, err
+			}
+			if !isNameServerNotFoundError(err) {
+				// Don't swallow transient errors — Crossplane should requeue, not call Create.
+				return managed.ExternalObservation{}, errors.Wrapf(err, "failed to observe nameserver group %q", lookupID)
+			}
+			c.log.Info("nameserver group not found by id, attempting adoption by name", "lookup-id", lookupID)
+		}
+	}
+	if nameservergroup == nil {
 		groups, err := client.DNS.ListNameserverGroups(ctx)
 		if err != nil {
+			if auth.IsTokenInvalidError(err) {
+				c.authManager.ForceRefresh(ctx)
+				return managed.ExternalObservation{}, err
+			}
 			return managed.ExternalObservation{}, errors.Wrap(err, "failed to list nameserver groups for adoption")
 		}
 		var found *nbapi.NameserverGroup
@@ -144,27 +178,21 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		}
 		if found != nil {
 			meta.SetExternalName(cr, found.Id)
-			// Return early so the reconciler persists the external name and requeues
+			// Identity is persisted via status.atProvider.id (external-name set
+			// during Observe is not persisted by the runtime), which the lookup
+			// resolver prefers on subsequent reconciles.
+			cr.Status.AtProvider.Id = found.Id
 			return managed.ExternalObservation{
 				ResourceExists:   true,
 				ResourceUpToDate: false, // force a requeue for a fresh Observe
 			}, nil
-		} else {
-			return managed.ExternalObservation{ResourceExists: false}, nil
 		}
+		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
-	// Now continue with normal observation using externalName
 
-	nameservergroup, err := client.DNS.GetNameserverGroup(ctx, externalName)
-	if err != nil {
-		if auth.IsTokenInvalidError(err) {
-			c.authManager.ForceRefresh(ctx)
-			return managed.ExternalObservation{}, err
-		}
-		c.log.Info("failed to get nameserver group")
-		return managed.ExternalObservation{
-			ResourceExists: false,
-		}, nil //return nil so that observe can return without error so that it passes to create.
+	// Repair stale or missing external-name annotations after recovering via status ID.
+	if externalName != nameservergroup.Id {
+		meta.SetExternalName(cr, nameservergroup.Id)
 	}
 
 	cr.Status.AtProvider = v1alpha1.NbNameServerObservation{
@@ -186,6 +214,36 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		ResourceExists:   true,
 		ResourceUpToDate: isUpToDate,
 	}, nil
+}
+
+// resolveNameServerLookupID picks the best identifier to use when looking the
+// nameserver group up by ID, falling back to the recorded provider ID when the
+// external-name annotation is missing or was defaulted to the Kubernetes object
+// name by an older reconcile (before WithInitializers disabled the
+// NameAsExternalName default).
+func resolveNameServerLookupID(cr *v1alpha1.NbNameServer) string {
+	externalName := meta.GetExternalName(cr)
+	switch {
+	case externalName == "":
+		return cr.Status.AtProvider.Id
+	case cr.Status.AtProvider.Id != "" && cr.Status.AtProvider.Id != externalName &&
+		(externalName == cr.GetName() || externalName == cr.Spec.ForProvider.Name):
+		// Recover when the external name holds the Kubernetes object name (older
+		// reconciles) or the netbird display name (used as an adoption hint).
+		return cr.Status.AtProvider.Id
+	default:
+		return externalName
+	}
+}
+
+// isNameServerNotFoundError matches the "nameserver group: <id> not found"
+// message returned by the netbird REST API for a missing nameserver group.
+func isNameServerNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "nameserver") && strings.Contains(errStr, "not found")
 }
 
 func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
@@ -230,7 +288,11 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 		return managed.ExternalUpdate{}, errors.Wrap(err, "failed to get authenticated client")
 	}
 
-	_, err = client.DNS.UpdateNameserverGroup(ctx, meta.GetExternalName(cr), nbapi.PutApiDnsNameserversNsgroupIdJSONRequestBody{
+	nsGroupID := resolveNameServerLookupID(cr)
+	if nsGroupID == "" {
+		return managed.ExternalUpdate{}, errors.New("can't find nameserver group id")
+	}
+	_, err = client.DNS.UpdateNameserverGroup(ctx, nsGroupID, nbapi.PutApiDnsNameserversNsgroupIdJSONRequestBody{
 		Description:          cr.Spec.ForProvider.Description,
 		Domains:              cr.Spec.ForProvider.Domains,
 		Groups:               cr.Spec.ForProvider.Groups,
@@ -260,7 +322,11 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 		return errors.Wrap(err, "failed to get authenticated client")
 	}
 
-	if err := client.DNS.DeleteNameserverGroup(ctx, meta.GetExternalName(cr)); err != nil {
+	nsGroupID := resolveNameServerLookupID(cr)
+	if nsGroupID == "" {
+		return errors.New("can't find nameserver group id")
+	}
+	if err := client.DNS.DeleteNameserverGroup(ctx, nsGroupID); err != nil {
 		return errors.Wrap(err, "failed to delete nameserver group")
 	}
 

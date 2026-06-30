@@ -30,8 +30,8 @@ import (
 	"github.com/crossplane/netbird-crossplane-provider/apis/vpn/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	netbird "github.com/netbirdio/netbird/management/client/rest"
-	nbapi "github.com/netbirdio/netbird/management/server/http/api"
+	netbird "github.com/netbirdio/netbird/shared/management/client/rest"
+	nbapi "github.com/netbirdio/netbird/shared/management/http/api"
 )
 
 // Unlike many Kubernetes projects Crossplane does not use third party testing
@@ -106,6 +106,18 @@ func TestResolveNetworkResourceLookupID(t *testing.T) {
 			}(),
 			want: "real-id",
 		},
+		"ExternalNameStampedWithDisplayNameRecoversFromStatus": {
+			cr: func() *v1alpha1.NbNetworkResource {
+				n := &v1alpha1.NbNetworkResource{
+					ObjectMeta: metav1.ObjectMeta{Name: "tenant-my-res"},
+				}
+				n.Spec.ForProvider.Name = "my-res"
+				meta.SetExternalName(n, "my-res")
+				n.Status.AtProvider.Id = "real-id"
+				return n
+			}(),
+			want: "real-id",
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -176,6 +188,8 @@ func TestObserve(t *testing.T) {
 	})
 
 	t.Run("ByIDNotFoundReturnsResourceExistsFalse", func(t *testing.T) {
+		// Not-found by ID now falls back to adoption by name; with no matching
+		// resource in the list the result is still ResourceExists: false.
 		auth, srv := newFakeAuth(t, func(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case r.URL.Path == "/api/networks" && r.Method == http.MethodGet:
@@ -184,6 +198,9 @@ func TestObserve(t *testing.T) {
 			case r.URL.Path == "/api/networks/net-1/resources/real-id" && r.Method == http.MethodGet:
 				w.WriteHeader(http.StatusNotFound)
 				w.Write([]byte(`{"message":"resource: real-id not found","code":404}`))
+			case r.URL.Path == "/api/networks/net-1/resources" && r.Method == http.MethodGet:
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`[]`))
 			default:
 				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 			}
@@ -201,6 +218,84 @@ func TestObserve(t *testing.T) {
 		}
 		if obs.ResourceExists {
 			t.Errorf("expected ResourceExists=false on not-found, got %+v", obs)
+		}
+	})
+
+	t.Run("DisplayNameExternalNameAdoptsByName", func(t *testing.T) {
+		// external-name holds the netbird display name (an adoption hint); the first
+		// Create succeeded remotely but the ID was never persisted. Observe must
+		// adopt the existing resource by name instead of reporting not-exists (which
+		// drives a duplicate Create).
+		auth, srv := newFakeAuth(t, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/api/networks" && r.Method == http.MethodGet:
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`[{"id":"net-1","name":"my-net"}]`))
+			case r.URL.Path == "/api/networks/net-1/resources" && r.Method == http.MethodGet:
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`[{"id":"real-id","name":"my-res","enabled":true,"address":"1.1.1.1/32","type":"host"}]`))
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+			}
+		})
+		defer srv.Close()
+
+		e := external{authManager: auth}
+		cr := &v1alpha1.NbNetworkResource{ObjectMeta: metav1.ObjectMeta{Name: "tenant-my-res"}}
+		meta.SetExternalName(cr, "my-res") // display name, not an ID
+		cr.Spec.ForProvider.Name = "my-res"
+		cr.Spec.ForProvider.NetworkName = "my-net"
+
+		obs, err := e.Observe(context.Background(), cr)
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if !obs.ResourceExists {
+			t.Fatalf("expected adoption (ResourceExists=true), got %+v", obs)
+		}
+		if got := meta.GetExternalName(cr); got != "real-id" {
+			t.Errorf("expected external-name set to 'real-id', got %q", got)
+		}
+		if cr.Status.AtProvider.Id != "real-id" {
+			t.Errorf("expected status.atProvider.id 'real-id', got %q", cr.Status.AtProvider.Id)
+		}
+	})
+
+	t.Run("StaleExternalNameIDFallsBackToAdoptionByName", func(t *testing.T) {
+		// A stale ID-looking external-name (remote recreated out of band) returns
+		// not-found by ID and must then adopt the same-named resource.
+		auth, srv := newFakeAuth(t, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/api/networks" && r.Method == http.MethodGet:
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`[{"id":"net-1","name":"my-net"}]`))
+			case r.URL.Path == "/api/networks/net-1/resources/stale-id" && r.Method == http.MethodGet:
+				w.WriteHeader(http.StatusNotFound)
+				w.Write([]byte(`{"message":"resource: stale-id not found","code":404}`))
+			case r.URL.Path == "/api/networks/net-1/resources" && r.Method == http.MethodGet:
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`[{"id":"new-id","name":"my-res","enabled":true,"address":"1.1.1.1/32","type":"host"}]`))
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+			}
+		})
+		defer srv.Close()
+
+		e := external{authManager: auth}
+		cr := &v1alpha1.NbNetworkResource{ObjectMeta: metav1.ObjectMeta{Name: "k8s-name"}}
+		meta.SetExternalName(cr, "stale-id")
+		cr.Spec.ForProvider.Name = "my-res"
+		cr.Spec.ForProvider.NetworkName = "my-net"
+
+		obs, err := e.Observe(context.Background(), cr)
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if !obs.ResourceExists {
+			t.Fatalf("expected adoption (ResourceExists=true), got %+v", obs)
+		}
+		if got := meta.GetExternalName(cr); got != "new-id" {
+			t.Errorf("expected external-name repaired to 'new-id', got %q", got)
 		}
 	})
 
@@ -272,12 +367,109 @@ func TestObserve(t *testing.T) {
 	})
 }
 
+// TestIsNetworkResourceUpToDate exercises spec-vs-API drift detection.
+func TestIsNetworkResourceUpToDate(t *testing.T) {
+	strp := func(s string) *string { return &s }
+	base := func() (v1alpha1.NbNetworkResourceParameters, *nbapi.NetworkResource) {
+		spec := v1alpha1.NbNetworkResourceParameters{
+			Name:        "my-res",
+			Address:     "1.1.1.1/32",
+			Enabled:     true,
+			Description: strp("desc"),
+			Groups:      &[]v1alpha1.GroupMinimum{{Name: strp("routers")}},
+		}
+		res := &nbapi.NetworkResource{
+			Id:          "real-id",
+			Name:        "my-res",
+			Address:     "1.1.1.1/32",
+			Enabled:     true,
+			Description: strp("desc"),
+			Groups:      []nbapi.GroupMinimum{{Id: "g-1", Name: "routers"}},
+		}
+		return spec, res
+	}
+
+	t.Run("InSync", func(t *testing.T) {
+		spec, res := base()
+		if !isNetworkResourceUpToDate(spec, res) {
+			t.Error("expected up to date")
+		}
+	})
+	t.Run("DriftedDescription", func(t *testing.T) {
+		spec, res := base()
+		spec.Description = strp("new description")
+		if isNetworkResourceUpToDate(spec, res) {
+			t.Error("expected not up to date on description drift")
+		}
+	})
+	t.Run("DriftedEnabled", func(t *testing.T) {
+		spec, res := base()
+		spec.Enabled = false
+		if isNetworkResourceUpToDate(spec, res) {
+			t.Error("expected not up to date on enabled drift")
+		}
+	})
+	t.Run("DriftedGroupByName", func(t *testing.T) {
+		spec, res := base()
+		spec.Groups = &[]v1alpha1.GroupMinimum{{Name: strp("other-group")}}
+		if isNetworkResourceUpToDate(spec, res) {
+			t.Error("expected not up to date on group drift")
+		}
+	})
+	t.Run("NilSpecGroupsIgnored", func(t *testing.T) {
+		spec, res := base()
+		spec.Groups = nil
+		if !isNetworkResourceUpToDate(spec, res) {
+			t.Error("expected up to date when spec groups nil")
+		}
+	})
+}
+
+// TestUpdate covers Update error propagation (a failed API update previously
+// returned success, leaving the MR Synced while the remote was unchanged).
+func TestUpdate(t *testing.T) {
+	t.Run("APIErrorPropagates", func(t *testing.T) {
+		auth, srv := newFakeAuth(t, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/api/networks" && r.Method == http.MethodGet:
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`[{"id":"net-1","name":"my-net"}]`))
+			case r.URL.Path == "/api/groups" && r.Method == http.MethodGet:
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`[{"id":"g-1","name":"routers"}]`))
+			case r.URL.Path == "/api/networks/net-1/resources/real-id" && r.Method == http.MethodPut:
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(`{"message":"boom","code":500}`))
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+			}
+		})
+		defer srv.Close()
+
+		strp := func(s string) *string { return &s }
+		e := external{authManager: auth}
+		cr := &v1alpha1.NbNetworkResource{ObjectMeta: metav1.ObjectMeta{Name: "k8s-name"}}
+		meta.SetExternalName(cr, "real-id")
+		cr.Spec.ForProvider.Name = "my-res"
+		cr.Spec.ForProvider.NetworkName = "my-net"
+		cr.Spec.ForProvider.Groups = &[]v1alpha1.GroupMinimum{{Name: strp("routers")}}
+
+		_, err := e.Update(context.Background(), cr)
+		if err == nil {
+			t.Fatal("expected error from failed API update, got nil")
+		}
+		if !strings.Contains(err.Error(), "failed to update network resource") {
+			t.Errorf("expected wrapped update error, got %v", err)
+		}
+	})
+}
+
 // TestResolveGroupIDs exercises the spec-to-API group ID resolver.
 func TestResolveGroupIDs(t *testing.T) {
 	strp := func(s string) *string { return &s }
 	api := []nbapi.Group{
 		{Id: "g-all", Name: "All"},
-		{Id: "g-bao", Name: "bao-routers"},
+		{Id: "g-routers", Name: "routers"},
 	}
 	cases := map[string]struct {
 		spec    []v1alpha1.GroupMinimum
@@ -285,12 +477,12 @@ func TestResolveGroupIDs(t *testing.T) {
 		wantErr bool
 	}{
 		"by id wins over name": {
-			spec: []v1alpha1.GroupMinimum{{Id: strp("g-bao"), Name: strp("ignored")}},
-			want: []string{"g-bao"},
+			spec: []v1alpha1.GroupMinimum{{Id: strp("g-routers"), Name: strp("ignored")}},
+			want: []string{"g-routers"},
 		},
 		"by name resolves to api id": {
-			spec: []v1alpha1.GroupMinimum{{Name: strp("bao-routers")}},
-			want: []string{"g-bao"},
+			spec: []v1alpha1.GroupMinimum{{Name: strp("routers")}},
+			want: []string{"g-routers"},
 		},
 		"name nil falls through to error if id also nil": {
 			spec:    []v1alpha1.GroupMinimum{{}},
