@@ -18,7 +18,10 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -195,6 +198,13 @@ type SharedConnector struct {
 	cache     sync.Map
 }
 
+// cacheEntry pairs a cached AuthManager with a fingerprint of the
+// ProviderConfig inputs it was built from, so config changes invalidate it.
+type cacheEntry struct {
+	fingerprint string
+	manager     *AuthManager
+}
+
 // NewSharedConnector creates a new shared connector instance
 func NewSharedConnector(kube client.Client, usage resource.Tracker) *SharedConnector {
 	return &SharedConnector{
@@ -203,6 +213,17 @@ func NewSharedConnector(kube client.Client, usage resource.Tracker) *SharedConne
 		newAuthFn: NewAuthManager,
 		cache:     sync.Map{},
 	}
+}
+
+// configFingerprint hashes every ProviderConfig input the AuthManager bakes in
+// at construction time. If any of them changes, the cached manager is stale.
+func configFingerprint(endpoint, creds, credType, issuerURL string) string {
+	h := sha256.New()
+	for _, s := range []string{endpoint, creds, credType, issuerURL} {
+		// Length-prefix each field so concatenations can't collide.
+		fmt.Fprintf(h, "%d:%s", len(s), s)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // Connect handles the common connection logic for all controllers
@@ -216,12 +237,24 @@ func (c *SharedConnector) Connect(ctx context.Context, mg resource.Managed, pc *
 	if err != nil {
 		return nil, errors.Wrap(err, errGetCreds)
 	}
-	// Create cache key based on ProviderConfig UID
+	// Cache key is the ProviderConfig UID; the fingerprint invalidates the
+	// entry when the config's contents change. A ProviderConfig UPDATE keeps
+	// its UID, so keying by UID alone kept returning an AuthManager built for
+	// the old endpoint/credentials until the provider was restarted (e.g. a
+	// management-uri change was never picked up, nor a rotated token).
 	cacheKey := string(pc.UID)
+	fingerprint := configFingerprint(
+		pc.Spec.ManagementURI,
+		string(data),
+		pc.Spec.CredentialsType,
+		pc.Spec.OauthIssuerUrl,
+	)
 
-	// Load or create AuthManager
-	if manager, ok := c.cache.Load(cacheKey); ok {
-		return manager.(*AuthManager), nil
+	// Load the cached AuthManager, but only reuse it while its inputs match.
+	if entry, ok := c.cache.Load(cacheKey); ok {
+		if e, ok := entry.(cacheEntry); ok && e.fingerprint == fingerprint {
+			return e.manager, nil
+		}
 	}
 
 	manager := c.newAuthFn(
@@ -230,7 +263,7 @@ func (c *SharedConnector) Connect(ctx context.Context, mg resource.Managed, pc *
 		pc.Spec.CredentialsType,
 		pc.Spec.OauthIssuerUrl,
 	)
-	c.cache.Store(cacheKey, manager)
+	c.cache.Store(cacheKey, cacheEntry{fingerprint: fingerprint, manager: manager})
 	return manager, nil
 }
 
