@@ -18,6 +18,7 @@ package nbpolicy
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"strings"
 
@@ -204,7 +205,21 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		meta.SetExternalName(cr, *policy.Id)
 	}
 
-	uptodate := IsApiToNBPolicyUpToDate(cr.Spec.ForProvider, policy, c)
+	// The spec may reference groups by name; resolve them against the current
+	// group list so the comparison is by id. A resource being deleted skips the
+	// comparison, so a failing group listing cannot block its deletion.
+	uptodate := true
+	if !meta.WasDeleted(cr) {
+		groups, err := client.Groups.List(ctx)
+		if err != nil {
+			if auth.IsTokenInvalidError(err) {
+				c.authManager.ForceRefresh(ctx)
+				return managed.ExternalObservation{}, err
+			}
+			return managed.ExternalObservation{}, errors.Wrap(err, "failed to list groups")
+		}
+		uptodate = IsApiToNBPolicyUpToDate(cr.Spec.ForProvider, policy, groups, c)
+	}
 	cr.Status.AtProvider = v1alpha1.NbPolicyObservation{
 		Id:                  policy.Id,
 		Enabled:             policy.Enabled,
@@ -359,13 +374,9 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 func NbToApiRules(policyRule *[]v1alpha1.PolicyRule, groups []nbapi.Group) ([]nbapi.PolicyRuleUpdate, error) {
 	rules := make([]nbapi.PolicyRuleUpdate, len(*policyRule))
 	for i, prule := range *policyRule {
-		destinations, desterr := NbToApiGroupMinimums(prule.Destinations, groups)
-		if desterr != nil {
-			return nil, desterr
-		}
-		sources, sourceerr := NbToApiGroupMinimums(prule.Sources, groups)
-		if sourceerr != nil {
-			return nil, sourceerr
+		sources, destinations, err := resolveRuleGroups(i, prule, groups)
+		if err != nil {
+			return nil, err
 		}
 		rules[i] = nbapi.PolicyRuleUpdate{
 			Action:        nbapi.PolicyRuleUpdateAction(prule.Action),
@@ -398,28 +409,116 @@ func NbToApiPortRanges(rulePortRange *[]v1alpha1.RulePortRange) *[]nbapi.RulePor
 	return &rportrange
 }
 
+// NbToApiGroupMinimums resolves the spec's group references into the group ids
+// the netbird API expects, in spec order. Each entry is matched by Id first and,
+// when the Id is absent or matches no group, by Name. Every entry must resolve:
+// an unknown reference, or a Name carried by more than one group (netbird allows
+// duplicate group names), is an error naming the entry, so the API is never sent
+// an empty or arbitrarily chosen id. A nil list resolves to nil.
 func NbToApiGroupMinimums(groupMinimums *[]v1alpha1.GroupMinimum, groups []nbapi.Group) (*[]string, error) {
-	ids := make([]string, len(*groupMinimums))
-	err := errors.New("couldnt resolve group")
-	for i, gmin := range *groupMinimums {
-		for _, group := range groups {
-			if gmin.Id != nil && group.Id == *gmin.Id {
-				ids[i] = group.Id
-				err = nil
-				break
-			} else {
-				if gmin.Name != nil && group.Name == *gmin.Name {
-					ids[i] = group.Id
-					err = nil
-					break
-				}
-			}
-		}
+	if groupMinimums == nil {
+		return nil, nil
 	}
-	return &ids, err
+	ids := make([]string, len(*groupMinimums))
+	for i, gmin := range *groupMinimums {
+		id, err := resolveGroupID(gmin, groups)
+		if err != nil {
+			return nil, err
+		}
+		ids[i] = id
+	}
+	return &ids, nil
 }
 
-func IsApiToNBPolicyUpToDate(nbPolicy v1alpha1.NbPolicyParameters, policy *nbapi.Policy, c *external) bool {
+// resolveRuleGroups resolves one rule's destinations and sources; an error
+// names the rule (by name, or by index when unnamed) and the direction.
+func resolveRuleGroups(i int, prule v1alpha1.PolicyRule, groups []nbapi.Group) (sources, destinations *[]string, err error) {
+	label := fmt.Sprintf("rule %d", i)
+	if prule.Name != "" {
+		label = fmt.Sprintf("rule %q", prule.Name)
+	}
+	if destinations, err = NbToApiGroupMinimums(prule.Destinations, groups); err != nil {
+		return nil, nil, errors.Wrapf(err, "%s destinations", label)
+	}
+	if sources, err = NbToApiGroupMinimums(prule.Sources, groups); err != nil {
+		return nil, nil, errors.Wrapf(err, "%s sources", label)
+	}
+	return sources, destinations, nil
+}
+
+// resolveGroupID resolves one group reference against the account's groups.
+// By name, a set Issued (api, integration, jwt) restricts the candidates to
+// groups of that origin; resolution by Id ignores Issued.
+func resolveGroupID(gmin v1alpha1.GroupMinimum, groups []nbapi.Group) (string, error) {
+	hasID := gmin.Id != nil && *gmin.Id != ""
+	hasName := gmin.Name != nil && *gmin.Name != ""
+	if hasID {
+		for _, group := range groups {
+			if group.Id == *gmin.Id {
+				return group.Id, nil
+			}
+		}
+		if !hasName {
+			return "", errors.Errorf("group not found by id: %q", *gmin.Id)
+		}
+	}
+	if !hasName {
+		return "", errors.New("group reference missing both id and name")
+	}
+	issued := ""
+	if gmin.Issued != nil {
+		issued = *gmin.Issued
+	}
+	var matched []string
+	for _, group := range groups {
+		if group.Name != *gmin.Name {
+			continue
+		}
+		if issued != "" && (group.Issued == nil || string(*group.Issued) != issued) {
+			continue
+		}
+		matched = append(matched, group.Id)
+	}
+	switch len(matched) {
+	case 0:
+		if issued != "" {
+			return "", errors.Errorf("group not found by name: %q issued %q", *gmin.Name, issued)
+		}
+		return "", errors.Errorf("group not found by name: %q", *gmin.Name)
+	case 1:
+		return matched[0], nil
+	default:
+		label := fmt.Sprintf("group name %q", *gmin.Name)
+		if issued != "" {
+			label += fmt.Sprintf(" issued %q", issued)
+		}
+		return "", errors.Errorf("%s is ambiguous: %d groups carry it (ids %s); reference it by id", label, len(matched), strings.Join(matched, ", "))
+	}
+}
+
+// groupIDsEqual reports whether the API rule's groups are, position by
+// position, the given ids; a nil list equals an empty one.
+func groupIDsEqual(api *[]v1alpha1.GroupMinimum, ids *[]string) bool {
+	var a []v1alpha1.GroupMinimum
+	var want []string
+	if api != nil {
+		a = *api
+	}
+	if ids != nil {
+		want = *ids
+	}
+	if len(a) != len(want) {
+		return false
+	}
+	for j, id := range want {
+		if a[j].Id == nil || *a[j].Id != id {
+			return false
+		}
+	}
+	return true
+}
+
+func IsApiToNBPolicyUpToDate(nbPolicy v1alpha1.NbPolicyParameters, policy *nbapi.Policy, groups []nbapi.Group, c *external) bool {
 	c.log.Info("Checking if API policy is up to date", "policy", policy)
 	c.log.Info("Checking if API policy is up to date", "nbPolicy", nbPolicy)
 	if nbPolicy.Rules == nil || policy.Rules == nil {
@@ -446,31 +545,27 @@ func IsApiToNBPolicyUpToDate(nbPolicy v1alpha1.NbPolicyParameters, policy *nbapi
 			c.log.Info("bidirectional doesn't match")
 			return false
 		}
-		// Compare only the Id field of each destination
-		destA := policyrule.Destinations
-		destB := nbPolicy.Rules[i].Destinations
-		if destA == nil || destB == nil || len(*destA) != len(*destB) {
-			c.log.Info("destinations length doesn't match or is nil")
+		// Compare the API's group ids with the ids the spec resolves to, so a
+		// group referenced by name only is compared too. A spec that cannot be
+		// resolved never matches: the resulting Update surfaces the error.
+		sources, destinations, err := resolveRuleGroups(i, nbPolicy.Rules[i], groups)
+		if err != nil {
+			c.log.Info("rule groups don't resolve", "error", err)
 			return false
 		}
-		for j := range *destA {
-			if (*destA)[j].Id == nil || (*destB)[j].Id == nil || *(*destA)[j].Id != *(*destB)[j].Id {
-				c.log.Info("destination id doesn't match", "index", j)
-				return false
-			}
-		}
-		// Compare only the Id field of each source
-		srcA := policyrule.Sources
-		srcB := nbPolicy.Rules[i].Sources
-		if srcA == nil || srcB == nil || len(*srcA) != len(*srcB) {
-			c.log.Info("sources length doesn't match or is nil")
+		if !groupIDsEqual(policyrule.Destinations, destinations) {
+			c.log.Info("destinations don't match")
 			return false
 		}
-		for j := range *srcA {
-			if (*srcA)[j].Id == nil || (*srcB)[j].Id == nil || *(*srcA)[j].Id != *(*srcB)[j].Id {
-				c.log.Info("source id doesn't match", "index", j)
-				return false
-			}
+		// Known limitation: netbird's GET omits a source group already listed
+		// earlier in the same policy (one group cache per policy in
+		// toPolicyResponse), so a policy that reuses a source group across
+		// rules, or repeats it within a rule, never compares equal and is PUT
+		// on every reconcile. The response cannot tell what is stored for those
+		// ids, so the check stays strict rather than risk missing a real change.
+		if !groupIDsEqual(policyrule.Sources, sources) {
+			c.log.Info("sources don't match")
+			return false
 		}
 		// PortRanges nil check and comparison
 		if policyrule.PortRanges == nil && nbPolicy.Rules[i].PortRanges != nil {
