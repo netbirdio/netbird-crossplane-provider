@@ -182,23 +182,37 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 			// Don't swallow transient errors — a failed list must not look like "doesn't exist".
 			return managed.ExternalObservation{}, errors.Wrap(err, "failed to list setup keys for adoption")
 		}
-		for _, key := range keys {
-			if key.Name == cr.Spec.ForProvider.Name && !key.Revoked && key.Expires.After(time.Now()) {
-				c.log.Info("adopting existing setup key", "setup-key-id", key.Id)
-				meta.SetExternalName(cr, key.Id)
-				// Identity is persisted via status.atProvider.id (external-name set
-				// during Observe is not persisted by the runtime), which the lookup
-				// resolver prefers. Report up-to-date: Update would rotate (delete)
-				// the key, which must stay reserved for the expired/revoked path.
-				cr.Status.AtProvider.Id = key.Id
-				cr.Status.SetConditions(xpv1.Available())
-				return managed.ExternalObservation{
-					ResourceExists:   true,
-					ResourceUpToDate: true,
-				}, nil
+		// Prefer a valid key. A revoked spec falls back to any key of that name,
+		// so a still-valid key is the one the next reconcile revokes.
+		var adopt *api.SetupKey
+		for i := range keys {
+			key := &keys[i]
+			if key.Name != cr.Spec.ForProvider.Name {
+				continue
+			}
+			if !key.Revoked && key.Expires.After(time.Now()) {
+				adopt = key
+				break
+			}
+			if cr.Spec.ForProvider.Revoked && adopt == nil {
+				adopt = key
 			}
 		}
-		return managed.ExternalObservation{ResourceExists: false}, nil
+		if adopt == nil {
+			return managed.ExternalObservation{ResourceExists: false}, nil
+		}
+		c.log.Info("adopting existing setup key", "setup-key-id", adopt.Id)
+		meta.SetExternalName(cr, adopt.Id)
+		// Identity is persisted via status.atProvider.id (external-name set
+		// during Observe is not persisted by the runtime), which the lookup
+		// resolver prefers. Report up-to-date: Update would rotate (delete)
+		// the key, which must stay reserved for the expired/revoked path.
+		cr.Status.AtProvider.Id = adopt.Id
+		cr.Status.SetConditions(xpv1.Available())
+		return managed.ExternalObservation{
+			ResourceExists:   true,
+			ResourceUpToDate: true,
+		}, nil
 	}
 
 	// Repair stale or missing external-name annotations after recovering via status ID.
@@ -206,13 +220,6 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		meta.SetExternalName(cr, setupkey.Id)
 	}
 
-	if setupkey.Expires.Before(time.Now()) || setupkey.Revoked {
-		// Token setupkey exists but is expired or revoked: trigger Update, not Create
-		return managed.ExternalObservation{
-			ResourceExists:   true,
-			ResourceUpToDate: false,
-		}, nil
-	}
 	cr.Status.AtProvider = v1alpha1.NbSetupKeyObservation{
 		Id:                  setupkey.Id,
 		AllowExtraDnsLabels: setupkey.AllowExtraDnsLabels,
@@ -226,13 +233,64 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		Type:                setupkey.Type,
 	}
 
+	expired := setupkey.Expires.Before(time.Now())
+	if cr.Spec.ForProvider.Revoked {
+		// Revocation is one-way in netbird, so a revoked or expired key is the
+		// desired end state; only a still-valid key needs Update to revoke it.
+		cr.Status.SetConditions(xpv1.Available())
+		return managed.ExternalObservation{
+			ResourceExists:   true,
+			ResourceUpToDate: setupkey.Revoked || expired,
+		}, nil
+	}
+	if expired || setupkey.Revoked {
+		// Token setupkey exists but is expired or revoked: trigger Update, not Create
+		return managed.ExternalObservation{
+			ResourceExists:   true,
+			ResourceUpToDate: false,
+		}, nil
+	}
+
 	cr.Status.SetConditions(xpv1.Available())
 
 	return managed.ExternalObservation{
 		ResourceExists:    true,
-		ResourceUpToDate:  true,
+		ResourceUpToDate:  sameGroups(cr.Spec.ForProvider.AutoGroups, setupkey.AutoGroups),
 		ConnectionDetails: managed.ConnectionDetails{},
 	}, nil
+}
+
+// sameGroups compares auto-group ID lists ignoring order; nil and empty are equal.
+func sameGroups(want, got []string) bool {
+	if len(want) != len(got) {
+		return false
+	}
+	seen := make(map[string]int, len(want))
+	for _, g := range want {
+		seen[g]++
+	}
+	for _, g := range got {
+		if seen[g] == 0 {
+			return false
+		}
+		seen[g]--
+	}
+	return true
+}
+
+// needsRotation reports whether a key can no longer enroll peers while the spec
+// still wants a usable key. netbird cannot un-revoke, so the key is replaced.
+func needsRotation(cr *v1alpha1.NbSetupKey, setupkey *api.SetupKey) bool {
+	return !cr.Spec.ForProvider.Revoked && (setupkey.Revoked || setupkey.Expires.Before(time.Now()))
+}
+
+// keyRequest is the PUT body for the fields netbird lets an existing key change.
+func keyRequest(cr *v1alpha1.NbSetupKey) api.PutApiSetupKeysKeyIdJSONRequestBody {
+	groups := cr.Spec.ForProvider.AutoGroups
+	if groups == nil {
+		groups = []string{}
+	}
+	return api.PutApiSetupKeysKeyIdJSONRequestBody{AutoGroups: groups, Revoked: cr.Spec.ForProvider.Revoked}
 }
 
 // resolveSetupKeyLookupID picks the best identifier to use when looking the setup
@@ -264,19 +322,6 @@ func isSetupKeyNotFoundError(err error) bool {
 	return strings.Contains(errStr, "setup key") && strings.Contains(errStr, "not found")
 }
 
-// func isUpToDate(nbSetupKeyParameters *v1alpha1.NbSetupKeyParameters, setupkey *api.SetupKey, log logr.Logger) bool {
-
-// 	if !reflect.DeepEqual(nbSetupKeyParameters.AutoGroups, setupkey.AutoGroups) {
-// 		log.Info("update failed on auto groups")
-// 		return false
-// 	}
-// 	if !cmp.Equal(nbSetupKeyParameters.Revoked, setupkey.Revoked) {
-// 		log.Info("update failed on revoked")
-// 		return false
-// 	}
-// 	return true
-// }
-
 func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
 	cr, ok := mg.(*v1alpha1.NbSetupKey)
 	if !ok {
@@ -305,6 +350,13 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 		}, err
 	}
 	meta.SetExternalName(cr, setupkey.Id)
+	if cr.Spec.ForProvider.Revoked {
+		// netbird cannot create a revoked key. Revoke it straight away; on failure
+		// the next Observe sees a valid key and Update revokes it.
+		if _, err := client.SetupKeys.Update(ctx, setupkey.Id, keyRequest(cr)); err != nil {
+			c.log.Info("revoking new setup key failed, will retry on update", "setup-key-id", setupkey.Id, "error", err.Error())
+		}
+	}
 	cd := managed.ConnectionDetails{xpv1.ResourceCredentialsSecretPasswordKey: []byte(setupkey.Key)}
 	return managed.ExternalCreation{
 		// Optionally return any details that may be required to connect to the
@@ -326,6 +378,17 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 	setupKeyId := resolveSetupKeyLookupID(cr)
 	if setupKeyId == "" {
 		return managed.ExternalUpdate{}, errors.New("can't find setupKeyId")
+	}
+	setupkey, err := client.SetupKeys.Get(ctx, setupKeyId)
+	if err != nil {
+		return managed.ExternalUpdate{}, errors.Wrapf(err, "failed to get setup key %q", setupKeyId)
+	}
+	if !needsRotation(cr, setupkey) {
+		// Revocation and auto-group changes apply in place and keep the key value.
+		if _, err := client.SetupKeys.Update(ctx, setupKeyId, keyRequest(cr)); err != nil {
+			return managed.ExternalUpdate{}, errors.Wrapf(err, "failed to update setup key %q", setupKeyId)
+		}
+		return managed.ExternalUpdate{}, nil
 	}
 	if err := client.SetupKeys.Delete(ctx, setupKeyId); err != nil {
 		return managed.ExternalUpdate{}, errors.Wrap(err, "failed to delete expired setupkey")
